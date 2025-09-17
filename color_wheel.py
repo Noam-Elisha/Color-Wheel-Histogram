@@ -19,7 +19,7 @@ import pickle
 import os
 
 
-def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
+def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
     """
     Create a precomputed wheel template with full-resolution RGB values and quantized color lookup.
     This generates a high-quality wheel with smooth gradients while maintaining compatibility 
@@ -114,9 +114,14 @@ def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
     wheel_rgb[valid_indices[0], valid_indices[1], 2] = wheel_b_full
     
     # Create quantized versions ONLY for the color mapping (to match input image analysis)
-    wheel_r_quantized = (wheel_r_full // 8) * 8
-    wheel_g_quantized = (wheel_g_full // 8) * 8
-    wheel_b_quantized = (wheel_b_full // 8) * 8
+    if quantize_level > 1:
+        wheel_r_quantized = (wheel_r_full // quantize_level) * quantize_level
+        wheel_g_quantized = (wheel_g_full // quantize_level) * quantize_level
+        wheel_b_quantized = (wheel_b_full // quantize_level) * quantize_level
+    else:
+        wheel_r_quantized = wheel_r_full
+        wheel_g_quantized = wheel_g_full
+        wheel_b_quantized = wheel_b_full
     
     # Create color-to-pixels mapping using quantized colors (for compatibility with input analysis)
     color_to_pixels_map = {}
@@ -133,25 +138,25 @@ def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
     return wheel_rgb, color_to_pixels_map
 
 
-def get_wheel_template_path(wheel_size, inner_radius_ratio):
+def get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level):
     """Get the path for the wheel template file in a dedicated templates folder."""
     # Create templates directory if it doesn't exist
     templates_dir = "wheel_templates"
     if not os.path.exists(templates_dir):
         os.makedirs(templates_dir)
     
-    filename = f"wheel_template_fullres_{wheel_size}_{inner_radius_ratio:.3f}.pkl"
+    filename = f"wheel_template_fullres_{wheel_size}_{inner_radius_ratio:.3f}_q{quantize_level}.pkl"
     return os.path.join(templates_dir, filename)
 
 
-def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
+def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
     """
     Load existing wheel template or create a new one if it doesn't exist.
     
     Returns:
         tuple: (wheel_rgb, color_to_pixels_map)
     """
-    template_path = get_wheel_template_path(wheel_size, inner_radius_ratio)
+    template_path = get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level)
     
     if os.path.exists(template_path):
         print(f"Loading precomputed wheel template: {template_path}")
@@ -159,7 +164,7 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
             return pickle.load(f)
     else:
         print(f"Creating new wheel template: {template_path}")
-        template_data = create_wheel_template(wheel_size, inner_radius_ratio)
+        template_data = create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
         
         # Save the template for future use
         with open(template_path, 'wb') as f:
@@ -169,13 +174,14 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
         return template_data
 
 
-def load_and_analyze_image(image_path, sample_factor=4):
+def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
     """
     Load an image and analyze color frequencies as percentages.
     
     Args:
         image_path (str): Path to the input image
         sample_factor (int): Factor to downsample image for faster processing
+        quantize_level (int): Color quantization level (1=no quantization, higher=more grouping)
         
     Returns:
         dict: Color frequency percentages {(r,g,b): percentage}
@@ -199,7 +205,10 @@ def load_and_analyze_image(image_path, sample_factor=4):
     total_pixels = len(pixels)
     
     # Quantize colors to reduce noise (group similar colors) - vectorized
-    quantized_pixels = (pixels // 8) * 8
+    if quantize_level > 1:
+        quantized_pixels = (pixels // quantize_level) * quantize_level
+    else:
+        quantized_pixels = pixels  # No quantization
     
     # Use NumPy's unique function with return_counts for efficient counting
     # Convert RGB tuples to a single integer for efficient unique counting (using int64 to avoid overflow)
@@ -229,7 +238,7 @@ def rgb_to_hsv_normalized(r, g, b):
     return h * 360, s, v
 
 
-def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1):
+def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
     """
     Create a full color wheel where opacity represents color frequency.
     Areas with frequent colors are more opaque.
@@ -241,12 +250,13 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         color_percentages (dict): Color frequency percentages {(r,g,b): percentage}
         wheel_size (int): Size of the output wheel image
         inner_radius_ratio (float): Ratio of inner radius to outer radius
+        quantize_level (int): Color quantization level used in analysis
         
     Returns:
         tuple: (numpy.ndarray, dict) - RGBA image of the color wheel and normalized percentages
     """
     # Load or create the wheel template (cached on disk)
-    wheel_rgb, color_to_pixels_map = load_or_create_wheel_template(wheel_size, inner_radius_ratio)
+    wheel_rgb, color_to_pixels_map = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
     
     # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
@@ -283,7 +293,7 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     return wheel, normalized_percentages
 
 
-def add_wheel_gradient(wheel_size=800, inner_radius_ratio=0.1):
+def add_wheel_gradient(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
     """
     Create a reference color wheel with full saturation gradient.
     Uses the same precomputed template for consistency and speed.
@@ -292,7 +302,7 @@ def add_wheel_gradient(wheel_size=800, inner_radius_ratio=0.1):
         numpy.ndarray: RGBA image of a standard color wheel
     """
     # Load or create the wheel template (cached on disk)
-    wheel_rgb, _ = load_or_create_wheel_template(wheel_size, inner_radius_ratio)
+    wheel_rgb, _ = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
     
     # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
@@ -365,6 +375,8 @@ def main():
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
     parser.add_argument("--sample-factor", type=int, default=4, 
                        help="Factor to downsample input image for faster processing (default: 4)")
+    parser.add_argument("--quantize", type=int, default=8, 
+                       help="Color quantization level: 1=no quantization (most precise), higher=more grouping (default: 8)")
     parser.add_argument("--show-reference", action="store_true", 
                        help="Also save a reference color wheel for comparison")
     parser.add_argument("--format", choices=["png", "jpg"], default="png",
@@ -376,11 +388,11 @@ def main():
     
     try:
         print(f"Loading and analyzing image: {args.input_image}")
-        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor)
-        print(f"Found {len(color_percentages)} unique colors")
+        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize)
+        print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
         
         print("Generating color wheel...")
-        wheel, normalized_percentages = create_color_wheel(color_percentages, args.size)
+        wheel, normalized_percentages = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize)
         
         # Handle output format
         if args.format == "jpg":
@@ -424,7 +436,7 @@ def main():
         
         # Optionally save reference wheel
         if args.show_reference:
-            reference_wheel = add_wheel_gradient(args.size)
+            reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
             
             if args.format == "jpg":
                 # Convert reference wheel to RGB with black background
