@@ -13,9 +13,160 @@ import numpy as np
 import cv2
 import argparse
 import colorsys
-from collections import defaultdict
 import math
 import matplotlib.pyplot as plt
+import pickle
+import os
+
+
+def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
+    """
+    Create a precomputed wheel template with full-resolution RGB values and quantized color lookup.
+    This generates a high-quality wheel with smooth gradients while maintaining compatibility 
+    with quantized input image analysis.
+    
+    Returns:
+        tuple: (wheel_rgb, color_to_pixels_map)
+            - wheel_rgb: (H, W, 3) array with full-resolution RGB values
+            - color_to_pixels_map: dict mapping quantized (r,g,b) -> list of (y,x) coordinates
+    """
+    center = wheel_size // 2
+    outer_radius = center - 10
+    inner_radius = int(outer_radius * inner_radius_ratio)
+    
+    # Create coordinate grids
+    y_coords, x_coords = np.mgrid[0:wheel_size, 0:wheel_size]
+    
+    # Calculate distances and angles for all pixels at once
+    dx = x_coords - center
+    dy = y_coords - center
+    distances = np.sqrt(dx*dx + dy*dy)
+    
+    # Create mask for valid pixels (within ring)
+    valid_mask = (distances <= outer_radius) & (distances >= inner_radius)
+    
+    # Only process valid pixels to save computation
+    valid_indices = np.where(valid_mask)
+    valid_dx = dx[valid_indices]
+    valid_dy = dy[valid_indices]
+    valid_distances = distances[valid_indices]
+    
+    # Convert to polar coordinates (vectorized)
+    angles = np.arctan2(valid_dy, valid_dx)
+    hues = (angles + np.pi) * 180 / np.pi
+    
+    # Calculate saturation with higher precision for smoother gradients
+    saturations = (valid_distances - inner_radius) / (outer_radius - inner_radius)
+    values = np.ones_like(saturations)
+    
+    # Vectorized HSV to RGB conversion with full precision
+    hues_norm = hues / 360.0
+    c = values * saturations
+    x = c * (1 - np.abs((hues_norm * 6) % 2 - 1))
+    m = values - c
+    
+    # Determine RGB values based on hue sector
+    h_sector = (hues_norm * 6).astype(int) % 6
+    
+    r_vals = np.zeros_like(hues_norm)
+    g_vals = np.zeros_like(hues_norm)
+    b_vals = np.zeros_like(hues_norm)
+    
+    # Sector calculations with full precision
+    mask0 = h_sector == 0
+    r_vals[mask0] = c[mask0]
+    g_vals[mask0] = x[mask0]
+    
+    mask1 = h_sector == 1
+    r_vals[mask1] = x[mask1]
+    g_vals[mask1] = c[mask1]
+    
+    mask2 = h_sector == 2
+    g_vals[mask2] = c[mask2]
+    b_vals[mask2] = x[mask2]
+    
+    mask3 = h_sector == 3
+    g_vals[mask3] = x[mask3]
+    b_vals[mask3] = c[mask3]
+    
+    mask4 = h_sector == 4
+    r_vals[mask4] = x[mask4]
+    b_vals[mask4] = c[mask4]
+    
+    mask5 = h_sector == 5
+    r_vals[mask5] = c[mask5]
+    b_vals[mask5] = x[mask5]
+    
+    # Add m to get final RGB values
+    r_vals += m
+    g_vals += m
+    b_vals += m
+    
+    # Convert to full-resolution 0-255 range (no quantization for display)
+    wheel_r_full = (r_vals * 255).astype(np.uint8)
+    wheel_g_full = (g_vals * 255).astype(np.uint8)
+    wheel_b_full = (b_vals * 255).astype(np.uint8)
+    
+    # Create the base RGB wheel with full resolution
+    wheel_rgb = np.zeros((wheel_size, wheel_size, 3), dtype=np.uint8)
+    wheel_rgb[valid_indices[0], valid_indices[1], 0] = wheel_r_full
+    wheel_rgb[valid_indices[0], valid_indices[1], 1] = wheel_g_full
+    wheel_rgb[valid_indices[0], valid_indices[1], 2] = wheel_b_full
+    
+    # Create quantized versions ONLY for the color mapping (to match input image analysis)
+    wheel_r_quantized = (wheel_r_full // 8) * 8
+    wheel_g_quantized = (wheel_g_full // 8) * 8
+    wheel_b_quantized = (wheel_b_full // 8) * 8
+    
+    # Create color-to-pixels mapping using quantized colors (for compatibility with input analysis)
+    color_to_pixels_map = {}
+    for i, (y, x) in enumerate(zip(valid_indices[0], valid_indices[1])):
+        quantized_color = (wheel_r_quantized[i], wheel_g_quantized[i], wheel_b_quantized[i])
+        if quantized_color not in color_to_pixels_map:
+            color_to_pixels_map[quantized_color] = []
+        color_to_pixels_map[quantized_color].append((y, x))
+    
+    # Convert lists to numpy arrays for faster indexing
+    for color in color_to_pixels_map:
+        color_to_pixels_map[color] = np.array(color_to_pixels_map[color])
+    
+    return wheel_rgb, color_to_pixels_map
+
+
+def get_wheel_template_path(wheel_size, inner_radius_ratio):
+    """Get the path for the wheel template file in a dedicated templates folder."""
+    # Create templates directory if it doesn't exist
+    templates_dir = "wheel_templates"
+    if not os.path.exists(templates_dir):
+        os.makedirs(templates_dir)
+    
+    filename = f"wheel_template_fullres_{wheel_size}_{inner_radius_ratio:.3f}.pkl"
+    return os.path.join(templates_dir, filename)
+
+
+def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1):
+    """
+    Load existing wheel template or create a new one if it doesn't exist.
+    
+    Returns:
+        tuple: (wheel_rgb, color_to_pixels_map)
+    """
+    template_path = get_wheel_template_path(wheel_size, inner_radius_ratio)
+    
+    if os.path.exists(template_path):
+        print(f"Loading precomputed wheel template: {template_path}")
+        with open(template_path, 'rb') as f:
+            return pickle.load(f)
+    else:
+        print(f"Creating new wheel template: {template_path}")
+        template_data = create_wheel_template(wheel_size, inner_radius_ratio)
+        
+        # Save the template for future use
+        with open(template_path, 'wb') as f:
+            pickle.dump(template_data, f)
+        
+        print(f"Wheel template saved to: {template_path}")
+        return template_data
 
 
 def load_and_analyze_image(image_path, sample_factor=4):
@@ -43,20 +194,26 @@ def load_and_analyze_image(image_path, sample_factor=4):
         new_height, new_width = height // sample_factor, width // sample_factor
         image = cv2.resize(image, (new_width, new_height))
     
-    # Count color frequencies
-    color_counts = defaultdict(int)
+    # Count color frequencies using vectorized operations
     pixels = image.reshape(-1, 3)
     total_pixels = len(pixels)
     
-    for pixel in pixels:
-        # Quantize colors to reduce noise (group similar colors)
-        quantized_pixel = tuple((pixel // 8) * 8)  # Reduce to 32 levels per channel
-        color_counts[quantized_pixel] += 1
+    # Quantize colors to reduce noise (group similar colors) - vectorized
+    quantized_pixels = (pixels // 8) * 8
     
-    # Convert counts to percentages
+    # Use NumPy's unique function with return_counts for efficient counting
+    # Convert RGB tuples to a single integer for efficient unique counting (using int64 to avoid overflow)
+    rgb_as_int = quantized_pixels[:, 0].astype(np.int64) * 65536 + quantized_pixels[:, 1].astype(np.int64) * 256 + quantized_pixels[:, 2].astype(np.int64)
+    unique_colors, counts = np.unique(rgb_as_int, return_counts=True)
+    
+    # Convert back to RGB tuples and create percentage dictionary
     color_percentages = {}
-    for color, count in color_counts.items():
-        color_percentages[color] = count / total_pixels
+    for color_int, count in zip(unique_colors, counts):
+        # Convert back to RGB tuple
+        r = int((color_int // 65536) % 256)
+        g = int((color_int // 256) % 256)
+        b = int(color_int % 256)
+        color_percentages[(r, g, b)] = count / total_pixels
     
     return color_percentages
 
@@ -78,6 +235,8 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     Areas with frequent colors are more opaque.
     Areas with rare/missing colors are more transparent.
     
+    Uses a precomputed wheel template for maximum performance.
+    
     Args:
         color_percentages (dict): Color frequency percentages {(r,g,b): percentage}
         wheel_size (int): Size of the output wheel image
@@ -86,11 +245,12 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     Returns:
         tuple: (numpy.ndarray, dict) - RGBA image of the color wheel and normalized percentages
     """
-    # Create output image (RGBA)
+    # Load or create the wheel template (cached on disk)
+    wheel_rgb, color_to_pixels_map = load_or_create_wheel_template(wheel_size, inner_radius_ratio)
+    
+    # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
-    center = wheel_size // 2
-    outer_radius = center - 10  # Leave small border
-    inner_radius = int(outer_radius * inner_radius_ratio)
+    wheel[:, :, :3] = wheel_rgb  # Copy RGB channels
     
     # Find max percentage for normalization
     max_percentage = max(color_percentages.values()) if color_percentages else 1.0
@@ -100,51 +260,25 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     for color, percentage in color_percentages.items():
         normalized_percentages[color] = percentage / max_percentage
     
-    # Generate wheel pixels
-    for y in range(wheel_size):
-        for x in range(wheel_size):
-            # Calculate distance from center
-            dx = x - center
-            dy = y - center
-            distance = math.sqrt(dx*dx + dy*dy)
-            
-            # Skip pixels outside the wheel or inside inner circle
-            if distance > outer_radius or distance < inner_radius:
-                continue
-            
-            # Convert to polar coordinates
-            angle = math.atan2(dy, dx)  # -π to π
-            hue = (angle + math.pi) * 180 / math.pi  # Convert to 0-360 degrees
-            
-            # Calculate saturation (0 at inner_radius, 1 at outer_radius)
-            saturation = (distance - inner_radius) / (outer_radius - inner_radius)
-            
-            # Set maximum value/brightness for full color wheel
-            value = 1.0
-            
-            # Convert HSV back to RGB for the base wheel color
-            r, g, b = colorsys.hsv_to_rgb(hue/360, saturation, value)
-            wheel_r, wheel_g, wheel_b = int(r*255), int(g*255), int(b*255)
-            
-            # Quantize the wheel color to match our analysis quantization
-            quantized_color = ((wheel_r // 8) * 8, (wheel_g // 8) * 8, (wheel_b // 8) * 8)
-            
-            # Get the normalized frequency for this color (0-1 range)
-            normalized_frequency = normalized_percentages.get(quantized_color, 0)
-            
-            # Convert normalized frequency to opacity with boosted values
-            # Apply power curve to spread out the values and boost visibility
-            if normalized_frequency > 0:
-                # Boost all visible frequencies - even small ones become quite visible
-                boosted_frequency = normalized_frequency ** 20  # More aggressive boost
-                opacity = int(255 * boosted_frequency)
-                # Ensure minimum opacity for any color that exists in the image
-                opacity = max(opacity, 128)  # Minimum 128/255 opacity for any visible color
-            else:
-                opacity = 32  # Completely transparent for colors not in image
-            
-            # Set the pixel with frequency-based opacity
-            wheel[y, x] = [wheel_r, wheel_g, wheel_b, opacity]
+    # ULTRA-FAST APPROACH: Use the precomputed color-to-pixels mapping
+    # Instead of iterating through pixels, iterate through colors
+    for quantized_color, pixel_coords in color_to_pixels_map.items():
+        # Get the normalized frequency for this color
+        normalized_frequency = normalized_percentages.get(quantized_color, 0)
+        
+        # Calculate opacity based on frequency
+        if normalized_frequency > 0:
+            boosted_frequency = normalized_frequency ** 0.05  # More aggressive boost (lower power = more boost)
+            opacity = int(255 * boosted_frequency)
+            opacity = max(opacity, 128)  # Minimum 128/255 opacity for any visible color
+        else:
+            opacity = 32  # Low opacity for colors not in image
+        
+        # Set opacity for all pixels of this color at once (vectorized)
+        if len(pixel_coords) > 0:
+            y_coords = pixel_coords[:, 0]
+            x_coords = pixel_coords[:, 1]
+            wheel[y_coords, x_coords, 3] = opacity
             
     return wheel, normalized_percentages
 
@@ -152,33 +286,21 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
 def add_wheel_gradient(wheel_size=800, inner_radius_ratio=0.1):
     """
     Create a reference color wheel with full saturation gradient.
+    Uses the same precomputed template for consistency and speed.
     
     Returns:
         numpy.ndarray: RGBA image of a standard color wheel
     """
-    wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
-    center = wheel_size // 2
-    outer_radius = center - 10
-    inner_radius = int(outer_radius * inner_radius_ratio)
+    # Load or create the wheel template (cached on disk)
+    wheel_rgb, _ = load_or_create_wheel_template(wheel_size, inner_radius_ratio)
     
-    for y in range(wheel_size):
-        for x in range(wheel_size):
-            dx = x - center
-            dy = y - center
-            distance = math.sqrt(dx*dx + dy*dy)
-            
-            if distance > outer_radius or distance < inner_radius:
-                continue
-            
-            angle = math.atan2(dy, dx)
-            hue = (angle + math.pi) * 180 / math.pi
-            saturation = (distance - inner_radius) / (outer_radius - inner_radius)
-            value = 1.0
-            
-            r, g, b = colorsys.hsv_to_rgb(hue/360, saturation, value)
-            wheel_r, wheel_g, wheel_b = int(r*255), int(g*255), int(b*255)
-            
-            wheel[y, x] = [wheel_r, wheel_g, wheel_b, 255]
+    # Create output image (RGBA) - start with RGB template
+    wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
+    wheel[:, :, :3] = wheel_rgb  # Copy RGB channels
+    
+    # Set full opacity for all valid pixels (where RGB is not zero)
+    valid_pixels = np.any(wheel_rgb > 0, axis=2)
+    wheel[valid_pixels, 3] = 255  # Full opacity
     
     return wheel
 

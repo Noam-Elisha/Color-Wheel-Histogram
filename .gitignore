@@ -1,3 +1,7 @@
 *.png
 *.jpg
 *.jpeg
+*.pkl
+*.npy
+__pycache__/
+wheel_templates/
