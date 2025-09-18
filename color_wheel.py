@@ -748,24 +748,66 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, whee
     # Vectorized RGB to HSV conversion for image colors only
     image_hsv = rgb_to_hsv_vectorized(image_colors_array)  # Shape: (N, 3)
     
-    # Determine whether to use KD-tree
+    # Calculate dataset size metrics for decision making and logging
+    num_image_colors = len(image_colors)
+    num_wheel_colors = len(wheel_colors)
+    total_comparisons = num_image_colors * num_wheel_colors
+    
+    # Determine whether to use KD-tree with intelligent thresholds
     if force_kdtree is True:
         use_kdtree = KDTREE_AVAILABLE
+        decision_reasons = ["forced via --force-kdtree"]
         if not KDTREE_AVAILABLE:
             print("Warning: KD-tree requested but scikit-learn not available. Using fallback.")
+            decision_reasons = ["forced but scikit-learn not available"]
     elif force_kdtree is False:
         use_kdtree = False
+        decision_reasons = ["disabled via --no-kdtree"]
     else:
-        # Auto-detect based on dataset size - more aggressive thresholds for better performance
-        use_kdtree = KDTREE_AVAILABLE and (len(image_colors) > 50 or len(wheel_colors) > 200)
+        # INTELLIGENT KD-TREE THRESHOLD LOGIC
+        # KD-tree is beneficial when:
+        # 1. We have enough data points (KD-tree has overhead)
+        # 2. The brute force approach would be expensive
+        # 3. We're not in a degenerate case (very few wheel colors)
+        
+        min_colors_for_kdtree = 20  # Lower threshold - KD-tree can help even with small datasets
+        min_wheel_colors = 50       # Need reasonable number of wheel colors for KD-tree to be effective
+        expensive_threshold = 10000  # Total comparisons threshold where KD-tree becomes beneficial
+        
+        # Memory consideration: brute force uses O(N*M) memory for distance matrix
+        memory_limit_comparisons = 1_000_000  # ~8MB for float64 distances
+        
+        use_kdtree = (KDTREE_AVAILABLE and 
+                     num_image_colors >= min_colors_for_kdtree and
+                     num_wheel_colors >= min_wheel_colors and
+                     (total_comparisons >= expensive_threshold or 
+                      total_comparisons >= memory_limit_comparisons))
+        
+        # Debug info about the decision
+        decision_reasons = []
+        if not KDTREE_AVAILABLE:
+            decision_reasons.append("scikit-learn not available")
+        elif num_image_colors < min_colors_for_kdtree:
+            decision_reasons.append(f"too few image colors ({num_image_colors} < {min_colors_for_kdtree})")
+        elif num_wheel_colors < min_wheel_colors:
+            decision_reasons.append(f"too few wheel colors ({num_wheel_colors} < {min_wheel_colors})")
+        elif total_comparisons < expensive_threshold and total_comparisons < memory_limit_comparisons:
+            decision_reasons.append(f"dataset too small ({total_comparisons:,} comparisons)")
+        elif use_kdtree:
+            if total_comparisons >= memory_limit_comparisons:
+                decision_reasons.append("memory-limited dataset")
+            else:
+                decision_reasons.append("computationally expensive dataset")
     
-    # Debug: Show what method will be used
-    print(f"Nearest neighbor search: {len(image_colors):,} image colors vs {len(wheel_colors):,} wheel colors")
+    # Debug: Show what method will be used with reasoning
+    print(f"Nearest neighbor search: {len(image_colors):,} image colors vs {len(wheel_colors):,} wheel colors ({total_comparisons:,} total comparisons)")
     
     if use_kdtree:
-        print(f"Using KD-tree for nearest neighbor search (faster for large datasets)")
+        reason = decision_reasons[0] if decision_reasons else "optimal choice"
+        print(f"Using KD-tree for nearest neighbor search ({reason})")
         return _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv)
     else:
+        reason = decision_reasons[0] if decision_reasons else "small dataset"
         method_parts = []
         if not KDTREE_AVAILABLE:
             method_parts.append("KD-tree not available")
@@ -776,7 +818,7 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, whee
             method_parts.append("with JIT compilation")
         
         method = ", ".join(method_parts)
-        print(f"Using {method} for nearest neighbor search")
+        print(f"Using {method} for nearest neighbor search ({reason})")
         return _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv)
 
 
