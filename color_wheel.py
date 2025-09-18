@@ -57,6 +57,68 @@ def format_time(seconds):
         return f"{minutes}m {remaining_seconds:.1f}s"
 
 
+def prefilter_and_deduplicate_colors(color_percentages, similarity_threshold=8):
+    """
+    Pre-filter and deduplicate similar colors to reduce nearest-neighbor search complexity.
+    Groups colors that are within similarity_threshold distance in RGB space.
+    
+    Args:
+        color_percentages (dict): Original color frequency percentages {(r,g,b): percentage}
+        similarity_threshold (int): RGB distance threshold for grouping colors (default: 8)
+        
+    Returns:
+        tuple: (filtered_color_percentages, color_mapping)
+            - filtered_color_percentages: dict with representative colors and combined frequencies
+            - color_mapping: dict mapping original colors to their representative colors
+    """
+    if not color_percentages:
+        return {}, {}
+    
+    original_count = len(color_percentages)
+    
+    # FAST APPROACH: Use spatial binning/hashing instead of O(N²) comparison
+    # Create bins based on similarity threshold - colors in same bin are similar
+    bin_size = similarity_threshold
+    bins = {}  # bin_key -> list of colors in that bin
+    
+    for color in color_percentages.keys():
+        r, g, b = color
+        # Create bin coordinates by integer division
+        bin_key = (r // bin_size, g // bin_size, b // bin_size)
+        
+        if bin_key not in bins:
+            bins[bin_key] = []
+        bins[bin_key].append(color)
+    
+    # For each bin, choose representative color and combine frequencies
+    filtered_color_percentages = {}
+    color_mapping = {}
+    
+    for bin_colors in bins.values():
+        if not bin_colors:
+            continue
+            
+        # Choose representative color (the one with highest frequency in this bin)
+        representative_color = max(bin_colors, key=lambda c: color_percentages[c])
+        
+        # Combine frequencies
+        combined_frequency = sum(color_percentages[color] for color in bin_colors)
+        
+        # Store the result
+        filtered_color_percentages[representative_color] = combined_frequency
+        
+        # Create mapping for all colors in this bin
+        for color in bin_colors:
+            color_mapping[color] = representative_color
+    
+    filtered_count = len(filtered_color_percentages)
+    reduction_percent = (1 - filtered_count / original_count) * 100
+    
+    print(f"Color pre-filtering: {original_count:,} → {filtered_count:,} colors ({reduction_percent:.1f}% reduction)")
+    
+    return filtered_color_percentages, color_mapping
+
+
 def convert_adobe_rgb_to_srgb(image_rgb):
     """
     Convert Adobe RGB image to sRGB using colour-science library.
@@ -943,12 +1005,55 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     
     # Get all image colors and do vectorized nearest-neighbor lookup using cached HSV
     image_colors = list(normalized_percentages.keys())
+    prefilter_time = 0  # Initialize timing variables
+    nearest_neighbor_time = 0
+    
     if image_colors:
-        nearest_neighbor_start = time.time()
-        color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
-        nearest_neighbor_time = time.time() - nearest_neighbor_start
+        # PRE-FILTERING: Group similar colors to reduce search complexity
+        # Only use pre-filtering if we have enough colors to make it worthwhile
+        if len(image_colors) > 1000:  # Only pre-filter for large color sets
+            prefilter_start = time.time()
+            # More aggressive threshold for better reduction
+            threshold = max(4, quantize_level * 2)  # Larger threshold for more reduction
+            filtered_percentages, original_to_filtered_mapping = prefilter_and_deduplicate_colors(
+                normalized_percentages, 
+                similarity_threshold=threshold
+            )
+            filtered_colors = list(filtered_percentages.keys())
+            prefilter_time = time.time() - prefilter_start
+            
+            # Only use filtered results if we got significant reduction (>20%)
+            reduction_ratio = len(filtered_colors) / len(image_colors)
+            if reduction_ratio < 0.8:  # If we reduced by more than 20%
+                # Do nearest-neighbor search on filtered (reduced) set
+                nearest_neighbor_start = time.time()
+                filtered_color_mapping = find_nearest_wheel_colors_vectorized(filtered_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+                nearest_neighbor_time = time.time() - nearest_neighbor_start
+                
+                # Expand the filtered mapping back to original colors
+                color_mapping = {}
+                for original_color in image_colors:
+                    filtered_color = original_to_filtered_mapping[original_color]
+                    nearest_wheel_color = filtered_color_mapping[filtered_color]
+                    color_mapping[original_color] = nearest_wheel_color
+                
+                print(f"Pre-filtering saved {len(image_colors) - len(filtered_colors):,} nearest-neighbor searches ({prefilter_time*1000:.1f}ms)")
+            else:
+                # Pre-filtering didn't help enough, use original approach
+                print(f"Pre-filtering reduction too small ({reduction_ratio:.1%}), using direct search")
+                prefilter_time = 0
+                nearest_neighbor_start = time.time()
+                color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+                nearest_neighbor_time = time.time() - nearest_neighbor_start
+        else:
+            # Skip pre-filtering for small color sets
+            print(f"Skipping pre-filtering for small color set ({len(image_colors):,} colors)")
+            prefilter_time = 0
+            nearest_neighbor_start = time.time()
+            color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+            nearest_neighbor_time = time.time() - nearest_neighbor_start
         
-        # Accumulate frequencies for wheel colors
+        # Accumulate frequencies for wheel colors using original percentages
         for image_color, percentage in normalized_percentages.items():
             nearest_wheel_color = color_mapping[image_color]
             
@@ -986,7 +1091,10 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     opacity_mapping_time = time.time() - opacity_mapping_start
     
     wheel_time = time.time() - wheel_start
-    print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, nearest-neighbor: {format_time(nearest_neighbor_time) if image_colors else '0ms'}, opacity mapping: {format_time(opacity_mapping_time)})")
+    if image_colors:
+        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
+    else:
+        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
             
     return wheel, normalized_percentages, opacity_values
 
