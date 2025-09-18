@@ -17,6 +17,8 @@ import math
 import matplotlib.pyplot as plt
 import pickle
 import os
+import multiprocessing as mp
+from functools import partial
 try:
     from sklearn.neighbors import KDTree
     KDTREE_AVAILABLE = True
@@ -24,6 +26,14 @@ except ImportError:
     KDTREE_AVAILABLE = False
     print("Warning: scikit-learn not available. Using fallback nearest neighbor search.")
     print("For better performance with large color sets, install scikit-learn: pip install scikit-learn")
+
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: numba not available. Using standard NumPy operations.")
+    print("For better performance with numerical computations, install numba: pip install numba")
 
 
 def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
@@ -250,7 +260,7 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quanti
         return template_data
 
 
-def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
+def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_parallel=None):
     """
     Load an image and analyze color frequencies as percentages.
     
@@ -258,6 +268,7 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
         image_path (str): Path to the input image
         sample_factor (int): Factor to downsample image for faster processing
         quantize_level (int): Color quantization level (1=no quantization, higher=more grouping)
+        use_parallel (bool): Use parallel processing for large images (None=auto-detect)
         
     Returns:
         dict: Color frequency percentages {(r,g,b): percentage}
@@ -280,12 +291,30 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
     pixels = image.reshape(-1, 3)
     total_pixels = len(pixels)
     
+    print(f"Analyzing {total_pixels:,} pixels...")
+    
+    # Determine if we should use parallel processing
+    if use_parallel is None:
+        use_parallel = total_pixels > 1_000_000  # Use parallel for images > 1M pixels
+    
     # Quantize colors to reduce noise (group similar colors) - vectorized
     if quantize_level > 1:
         quantized_pixels = (pixels // quantize_level) * quantize_level
     else:
         quantized_pixels = pixels  # No quantization
     
+    if use_parallel and total_pixels > 500_000:
+        print("Using parallel processing for color analysis...")
+        color_percentages = _analyze_colors_parallel(quantized_pixels, total_pixels)
+    else:
+        print("Using single-threaded color analysis...")
+        color_percentages = _analyze_colors_single(quantized_pixels, total_pixels)
+    
+    return color_percentages
+
+
+def _analyze_colors_single(quantized_pixels, total_pixels):
+    """Single-threaded color analysis (original implementation)."""
     # Use NumPy's unique function with return_counts for efficient counting
     # Convert RGB tuples to a single integer for efficient unique counting (using int64 to avoid overflow)
     rgb_as_int = quantized_pixels[:, 0].astype(np.int64) * 65536 + quantized_pixels[:, 1].astype(np.int64) * 256 + quantized_pixels[:, 2].astype(np.int64)
@@ -304,6 +333,60 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
         color_percentages[(r_values[i], g_values[i], b_values[i])] = percentages[i]
     
     return color_percentages
+
+
+def _analyze_colors_parallel(quantized_pixels, total_pixels):
+    """Parallel color analysis using multiprocessing."""
+    # Split pixels into chunks for parallel processing
+    num_cores = min(mp.cpu_count(), 8)  # Limit to 8 cores to avoid memory issues
+    chunk_size = len(quantized_pixels) // num_cores
+    
+    if chunk_size < 10000:  # Not worth parallelizing for small chunks
+        return _analyze_colors_single(quantized_pixels, total_pixels)
+    
+    # Create chunks
+    chunks = []
+    for i in range(num_cores):
+        start_idx = i * chunk_size
+        if i == num_cores - 1:
+            end_idx = len(quantized_pixels)  # Last chunk gets remainder
+        else:
+            end_idx = (i + 1) * chunk_size
+        chunks.append(quantized_pixels[start_idx:end_idx])
+    
+    # Process chunks in parallel
+    with mp.Pool(num_cores) as pool:
+        chunk_results = pool.map(_process_color_chunk, chunks)
+    
+    # Merge results from all chunks
+    merged_color_counts = {}
+    for chunk_result in chunk_results:
+        for color_int, count in chunk_result.items():
+            if color_int in merged_color_counts:
+                merged_color_counts[color_int] += count
+            else:
+                merged_color_counts[color_int] = count
+    
+    # Convert back to RGB tuples and create percentage dictionary
+    color_percentages = {}
+    for color_int, count in merged_color_counts.items():
+        # Convert back to RGB tuple
+        r = int((color_int // 65536) % 256)
+        g = int((color_int // 256) % 256)
+        b = int(color_int % 256)
+        color_percentages[(r, g, b)] = count / total_pixels
+    
+    return color_percentages
+
+
+def _process_color_chunk(chunk):
+    """Process a chunk of pixels for color counting. Used by parallel processing."""
+    # Convert RGB tuples to integers for efficient counting
+    rgb_as_int = chunk[:, 0].astype(np.int64) * 65536 + chunk[:, 1].astype(np.int64) * 256 + chunk[:, 2].astype(np.int64)
+    unique_colors, counts = np.unique(rgb_as_int, return_counts=True)
+    
+    # Return as dictionary
+    return dict(zip(unique_colors, counts))
 
 
 def rgb_to_hsv_normalized(r, g, b):
@@ -327,6 +410,59 @@ def rgb_to_hsv_vectorized(rgb_array):
         
     Returns:
         numpy array of shape (N, 3) with HSV values
+    """
+    if NUMBA_AVAILABLE:
+        return _rgb_to_hsv_numba(rgb_array)
+    else:
+        return _rgb_to_hsv_numpy(rgb_array)
+
+
+@jit(nopython=True, parallel=True, cache=True) if NUMBA_AVAILABLE else lambda f: f
+def _rgb_to_hsv_numba(rgb_array):
+    """
+    Numba JIT-compiled RGB to HSV conversion for maximum performance.
+    Uses parallel processing for large arrays.
+    """
+    n = rgb_array.shape[0]
+    hsv = np.zeros((n, 3), dtype=np.float32)
+    
+    for i in prange(n):
+        r, g, b = rgb_array[i, 0], rgb_array[i, 1], rgb_array[i, 2]
+        
+        maxc = max(r, g, b)
+        minc = min(r, g, b)
+        
+        # Value
+        hsv[i, 2] = maxc
+        
+        # Saturation
+        if maxc != 0:
+            hsv[i, 1] = (maxc - minc) / maxc
+        else:
+            hsv[i, 1] = 0
+        
+        # Hue
+        if maxc == minc:
+            hsv[i, 0] = 0  # Gray
+        else:
+            delta = maxc - minc
+            if maxc == r:
+                hsv[i, 0] = (g - b) / delta
+                if hsv[i, 0] < 0:
+                    hsv[i, 0] += 6
+            elif maxc == g:
+                hsv[i, 0] = 2.0 + (b - r) / delta
+            else:  # maxc == b
+                hsv[i, 0] = 4.0 + (r - g) / delta
+            
+            hsv[i, 0] = hsv[i, 0] / 6.0
+    
+    return hsv
+
+
+def _rgb_to_hsv_numpy(rgb_array):
+    """
+    NumPy fallback RGB to HSV conversion (original implementation).
     """
     rgb = rgb_array
     maxc = np.max(rgb, axis=1)
@@ -374,7 +510,7 @@ def rgb_to_hsv_vectorized(rgb_array):
     return np.column_stack((h, s, v))
 
 
-def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree=None):
+def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree=None, use_parallel=None):
     """
     Find the nearest wheel colors for multiple image colors using vectorized HSV-based matching.
     This properly maps colors based on hue (angle) and saturation (radius) like a real color wheel.
@@ -385,6 +521,7 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, whee
         color_to_pixels_map (dict): Mapping of wheel colors to pixel coordinates
         wheel_hsv_cache (dict): Pre-computed HSV values for wheel colors {(r,g,b): [h,s,v]}
         force_kdtree (bool): Force KD-tree usage (True), disable it (False), or auto-detect (None)
+        use_parallel (bool): Use parallel processing where applicable (None=auto-detect)
         
     Returns:
         dict: Mapping {image_color: nearest_wheel_color}
@@ -419,7 +556,16 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, whee
         print(f"Using KD-tree for {len(image_colors)} image colors vs {len(wheel_colors)} wheel colors")
         return _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv)
     else:
-        method = "KD-tree not available" if not KDTREE_AVAILABLE else f"vectorized (dataset size: {len(image_colors)}x{len(wheel_colors)})"
+        method_parts = []
+        if not KDTREE_AVAILABLE:
+            method_parts.append("KD-tree not available")
+        else:
+            method_parts.append(f"vectorized (dataset size: {len(image_colors)}x{len(wheel_colors)})")
+        
+        if NUMBA_AVAILABLE and len(image_colors) * len(wheel_colors) > 10000:
+            method_parts.append("with JIT compilation")
+        
+        method = ", ".join(method_parts)
         print(f"Using {method} for nearest neighbor search")
         return _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv)
 
@@ -477,6 +623,45 @@ def _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv):
     return color_mapping
 
 
+@jit(nopython=True, parallel=True, cache=True) if NUMBA_AVAILABLE else lambda f: f
+def _calculate_hsv_distances_numba(image_hsv, wheel_hsv, hue_weight=3.0, sat_weight=1.0, val_weight=0.5):
+    """
+    JIT-compiled HSV distance calculation with parallel processing.
+    Much faster than NumPy broadcasting for large datasets.
+    
+    Args:
+        image_hsv: (N, 3) array of image HSV values
+        wheel_hsv: (M, 3) array of wheel HSV values
+        
+    Returns:
+        (N, M) array of distances
+    """
+    n_image = image_hsv.shape[0]
+    n_wheel = wheel_hsv.shape[0]
+    distances = np.zeros((n_image, n_wheel), dtype=np.float32)
+    
+    for i in prange(n_image):
+        img_h, img_s, img_v = image_hsv[i, 0], image_hsv[i, 1], image_hsv[i, 2]
+        
+        for j in range(n_wheel):
+            wheel_h, wheel_s, wheel_v = wheel_hsv[j, 0], wheel_hsv[j, 1], wheel_hsv[j, 2]
+            
+            # Calculate hue difference with wraparound
+            hue_diff = abs(img_h - wheel_h)
+            hue_diff = min(hue_diff, 1.0 - hue_diff)
+            
+            # Calculate other differences
+            sat_diff = img_s - wheel_s
+            val_diff = img_v - wheel_v
+            
+            # Weighted distance
+            distances[i, j] = (hue_weight * hue_diff * hue_diff + 
+                             sat_weight * sat_diff * sat_diff + 
+                             val_weight * val_diff * val_diff)
+    
+    return distances
+
+
 def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv):
     """
     Fallback vectorized nearest neighbor search (original implementation).
@@ -491,31 +676,37 @@ def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, whe
     Returns:
         dict: Mapping {image_color: nearest_wheel_color}
     """
-    # Vectorized HSV distance calculation with broadcasting
-    img_h = image_hsv[:, None, 0]  # Shape: (N, 1)
-    img_s = image_hsv[:, None, 1]  # Shape: (N, 1) 
-    img_v = image_hsv[:, None, 2]  # Shape: (N, 1)
-    
-    wheel_h = wheel_hsv[None, :, 0]  # Shape: (1, M)
-    wheel_s = wheel_hsv[None, :, 1]  # Shape: (1, M)
-    wheel_v = wheel_hsv[None, :, 2]  # Shape: (1, M)
-    
-    # Calculate hue differences with proper wraparound
-    hue_diff = np.abs(img_h - wheel_h)  # Shape: (N, M)
-    hue_diff = np.minimum(hue_diff, 1 - hue_diff)  # Handle wraparound
-    
-    # Calculate saturation and value differences
-    sat_diff = img_s - wheel_s  # Shape: (N, M)
-    val_diff = img_v - wheel_v  # Shape: (N, M)
-    
-    # Weighted distance calculation (vectorized)
-    hue_weight = 3.0    # Hue is most important for wheel position
-    sat_weight = 1.0    # Saturation determines distance from center
-    val_weight = 0.5    # Value is less important for wheel mapping
-    
-    distances = (hue_weight * hue_diff**2 + 
-                sat_weight * sat_diff**2 + 
-                val_weight * val_diff**2)  # Shape: (N, M)
+    # Use JIT-compiled version if available and dataset is large enough
+    if NUMBA_AVAILABLE and len(image_colors) * len(wheel_colors) > 10000:
+        print("Using JIT-compiled distance calculation...")
+        distances = _calculate_hsv_distances_numba(image_hsv, wheel_hsv)
+    else:
+        # Original NumPy broadcasting approach
+        # Vectorized HSV distance calculation with broadcasting
+        img_h = image_hsv[:, None, 0]  # Shape: (N, 1)
+        img_s = image_hsv[:, None, 1]  # Shape: (N, 1) 
+        img_v = image_hsv[:, None, 2]  # Shape: (N, 1)
+        
+        wheel_h = wheel_hsv[None, :, 0]  # Shape: (1, M)
+        wheel_s = wheel_hsv[None, :, 1]  # Shape: (1, M)
+        wheel_v = wheel_hsv[None, :, 2]  # Shape: (1, M)
+        
+        # Calculate hue differences with proper wraparound
+        hue_diff = np.abs(img_h - wheel_h)  # Shape: (N, M)
+        hue_diff = np.minimum(hue_diff, 1 - hue_diff)  # Handle wraparound
+        
+        # Calculate saturation and value differences
+        sat_diff = img_s - wheel_s  # Shape: (N, M)
+        val_diff = img_v - wheel_v  # Shape: (N, M)
+        
+        # Weighted distance calculation (vectorized)
+        hue_weight = 3.0    # Hue is most important for wheel position
+        sat_weight = 1.0    # Saturation determines distance from center
+        val_weight = 0.5    # Value is less important for wheel mapping
+        
+        distances = (hue_weight * hue_diff**2 + 
+                    sat_weight * sat_diff**2 + 
+                    val_weight * val_diff**2)  # Shape: (N, M)
     
     # Find nearest wheel color for each image color
     nearest_indices = np.argmin(distances, axis=1)  # Shape: (N,)
@@ -529,7 +720,7 @@ def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, whe
     return color_mapping
 
 
-def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None):
+def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None, use_parallel=None):
     """
     Create a full color wheel where opacity represents color frequency.
     Areas with frequent colors are more opaque.
@@ -543,6 +734,7 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         inner_radius_ratio (float): Ratio of inner radius to outer radius
         quantize_level (int): Color quantization level used in analysis
         force_kdtree (bool): Force KD-tree usage (True), disable it (False), or auto-detect (None)
+        use_parallel (bool): Use parallel processing where applicable (None=auto-detect)
         
     Returns:
         tuple: (numpy.ndarray, dict, list) - RGBA image of the color wheel, normalized percentages, and opacity values
@@ -575,12 +767,13 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     # VECTORIZED: Do all color mappings at once for massive speed improvement
     # CACHED: Use pre-computed HSV values for wheel colors
     # SPATIAL INDEXING: Use KD-tree for large datasets
+    # PARALLEL: Use JIT compilation and multiprocessing for performance
     wheel_color_frequencies = {}
     
     # Get all image colors and do vectorized nearest-neighbor lookup using cached HSV
     image_colors = list(normalized_percentages.keys())
     if image_colors:
-        color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree)
+        color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
         
         # Accumulate frequencies for wheel colors
         for image_color, percentage in normalized_percentages.items():
@@ -983,6 +1176,10 @@ def main():
                        help="Force KD-tree usage for nearest neighbor search (requires scikit-learn)")
     parser.add_argument("--no-kdtree", action="store_true",
                        help="Disable KD-tree and use vectorized fallback method")
+    parser.add_argument("--parallel", action="store_true",
+                       help="Force parallel processing for color analysis and computations")
+    parser.add_argument("--no-parallel", action="store_true",
+                       help="Disable parallel processing and use single-threaded methods")
     
     args = parser.parse_args()
     
@@ -996,13 +1193,35 @@ def main():
     elif args.no_kdtree:
         force_kdtree = False
     
+    # Handle parallel processing options
+    use_parallel = None
+    if args.parallel and args.no_parallel:
+        print("Error: Cannot specify both --parallel and --no-parallel")
+        return 1
+    elif args.parallel:
+        use_parallel = True
+    elif args.no_parallel:
+        use_parallel = False
+    
+    # Print available optimizations
+    optimizations = []
+    if NUMBA_AVAILABLE:
+        optimizations.append("Numba JIT compilation")
+    if KDTREE_AVAILABLE:
+        optimizations.append("KD-tree spatial indexing")
+    if mp.cpu_count() > 1:
+        optimizations.append(f"Multiprocessing ({mp.cpu_count()} cores)")
+    
+    if optimizations:
+        print(f"Available optimizations: {', '.join(optimizations)}")
+    
     try:
         print(f"Loading and analyzing image: {args.input_image}")
-        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize)
+        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize, use_parallel)
         print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
         
         print("Generating color wheel...")
-        wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree)
+        wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree, use_parallel=use_parallel)
         
         # Handle output format
         if args.format == "jpg":
