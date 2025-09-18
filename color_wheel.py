@@ -17,6 +17,13 @@ import math
 import matplotlib.pyplot as plt
 import pickle
 import os
+try:
+    from sklearn.neighbors import KDTree
+    KDTREE_AVAILABLE = True
+except ImportError:
+    KDTREE_AVAILABLE = False
+    print("Warning: scikit-learn not available. Using fallback nearest neighbor search.")
+    print("For better performance with large color sets, install scikit-learn: pip install scikit-learn")
 
 
 def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
@@ -26,9 +33,10 @@ def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level
     with quantized input image analysis.
     
     Returns:
-        tuple: (wheel_rgb, color_to_pixels_map)
+        tuple: (wheel_rgb, color_to_pixels_map, wheel_hsv_cache)
             - wheel_rgb: (H, W, 3) array with full-resolution RGB values
             - color_to_pixels_map: dict mapping quantized (r,g,b) -> list of (y,x) coordinates
+            - wheel_hsv_cache: dict mapping quantized (r,g,b) -> (h,s,v) for cached HSV conversions
     """
     center = wheel_size // 2
     outer_radius = center - 10
@@ -127,17 +135,61 @@ def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level
     
     # Create color-to-pixels mapping using quantized colors (for compatibility with input analysis)
     color_to_pixels_map = {}
-    for i, (y, x) in enumerate(zip(valid_indices[0], valid_indices[1])):
-        quantized_color = (wheel_r_quantized[i], wheel_g_quantized[i], wheel_b_quantized[i])
-        if quantized_color not in color_to_pixels_map:
-            color_to_pixels_map[quantized_color] = []
-        color_to_pixels_map[quantized_color].append((y, x))
     
-    # Convert lists to numpy arrays for faster indexing
-    for color in color_to_pixels_map:
-        color_to_pixels_map[color] = np.array(color_to_pixels_map[color])
+    # Pre-allocate arrays for quantized colors to avoid repeated calculations
+    num_pixels = len(valid_indices[0])
+    if quantize_level > 1:
+        wheel_r_quantized = (wheel_r_full // quantize_level) * quantize_level
+        wheel_g_quantized = (wheel_g_full // quantize_level) * quantize_level
+        wheel_b_quantized = (wheel_b_full // quantize_level) * quantize_level
+    else:
+        wheel_r_quantized = wheel_r_full
+        wheel_g_quantized = wheel_g_full
+        wheel_b_quantized = wheel_b_full
     
-    return wheel_rgb, color_to_pixels_map
+    # Group pixels by color using vectorized operations
+    unique_colors_int = (wheel_r_quantized.astype(np.int64) * 65536 + 
+                        wheel_g_quantized.astype(np.int64) * 256 + 
+                        wheel_b_quantized.astype(np.int64))
+    
+    # Get unique colors and their first occurrence indices
+    unique_color_ints, inverse_indices = np.unique(unique_colors_int, return_inverse=True)
+    
+    # Create mapping using pre-allocated arrays AND cache HSV conversions
+    wheel_hsv_cache = {}
+    
+    # Get unique quantized colors for HSV conversion
+    unique_colors_rgb = []
+    unique_color_tuples = []
+    
+    for i, color_int in enumerate(unique_color_ints):
+        # Convert back to RGB
+        r = int((color_int // 65536) % 256)
+        g = int((color_int // 256) % 256)  
+        b = int(color_int % 256)
+        color_tuple = (r, g, b)
+        unique_color_tuples.append(color_tuple)
+        unique_colors_rgb.append([r/255.0, g/255.0, b/255.0])  # Normalized for HSV conversion
+        
+        # Find all pixels with this color
+        pixel_mask = inverse_indices == i
+        pixel_indices = np.where(pixel_mask)[0]
+        
+        # Get y,x coordinates for these pixels
+        y_coords = valid_indices[0][pixel_indices]
+        x_coords = valid_indices[1][pixel_indices]
+        color_to_pixels_map[color_tuple] = np.column_stack([y_coords, x_coords])
+    
+    # VECTORIZED: Convert all unique wheel colors to HSV at once and cache them
+    if unique_colors_rgb:
+        unique_colors_array = np.array(unique_colors_rgb, dtype=np.float32)
+        unique_hsv = rgb_to_hsv_vectorized(unique_colors_array)  # Shape: (N, 3)
+        
+        # Cache HSV values for each unique color
+        for i, color_tuple in enumerate(unique_color_tuples):
+            wheel_hsv_cache[color_tuple] = unique_hsv[i]  # Store as numpy array [h, s, v]
+    
+    return wheel_rgb, color_to_pixels_map, wheel_hsv_cache
 
 
 def get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level):
@@ -156,14 +208,36 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quanti
     Load existing wheel template or create a new one if it doesn't exist.
     
     Returns:
-        tuple: (wheel_rgb, color_to_pixels_map)
+        tuple: (wheel_rgb, color_to_pixels_map, wheel_hsv_cache)
     """
     template_path = get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level)
     
     if os.path.exists(template_path):
         print(f"Loading precomputed wheel template: {template_path}")
         with open(template_path, 'rb') as f:
-            return pickle.load(f)
+            template_data = pickle.load(f)
+        
+        # Handle both old format (2 items) and new format (3 items) for backward compatibility
+        if len(template_data) == 2:
+            wheel_rgb, color_to_pixels_map = template_data
+            # Create HSV cache for old templates
+            print("Upgrading old template with HSV cache...")
+            wheel_colors = list(color_to_pixels_map.keys())
+            wheel_colors_array = np.array(wheel_colors, dtype=np.float32) / 255.0
+            wheel_hsv = rgb_to_hsv_vectorized(wheel_colors_array)
+            wheel_hsv_cache = {}
+            for i, color in enumerate(wheel_colors):
+                wheel_hsv_cache[color] = wheel_hsv[i]
+            
+            # Save updated template
+            template_data = (wheel_rgb, color_to_pixels_map, wheel_hsv_cache)
+            with open(template_path, 'wb') as f:
+                pickle.dump(template_data, f)
+            print(f"Updated template saved with HSV cache")
+        else:
+            wheel_rgb, color_to_pixels_map, wheel_hsv_cache = template_data
+            
+        return wheel_rgb, color_to_pixels_map, wheel_hsv_cache
     else:
         print(f"Creating new wheel template: {template_path}")
         template_data = create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
@@ -217,14 +291,17 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8):
     rgb_as_int = quantized_pixels[:, 0].astype(np.int64) * 65536 + quantized_pixels[:, 1].astype(np.int64) * 256 + quantized_pixels[:, 2].astype(np.int64)
     unique_colors, counts = np.unique(rgb_as_int, return_counts=True)
     
-    # Convert back to RGB tuples and create percentage dictionary
+    # Pre-allocate arrays for RGB conversion
+    num_unique = len(unique_colors)
+    r_values = ((unique_colors // 65536) % 256).astype(np.uint8)
+    g_values = ((unique_colors // 256) % 256).astype(np.uint8)  
+    b_values = (unique_colors % 256).astype(np.uint8)
+    percentages = counts / total_pixels
+    
+    # Create percentage dictionary using vectorized operations
     color_percentages = {}
-    for color_int, count in zip(unique_colors, counts):
-        # Convert back to RGB tuple
-        r = int((color_int // 65536) % 256)
-        g = int((color_int // 256) % 256)
-        b = int(color_int % 256)
-        color_percentages[(r, g, b)] = count / total_pixels
+    for i in range(num_unique):
+        color_percentages[(r_values[i], g_values[i], b_values[i])] = percentages[i]
     
     return color_percentages
 
@@ -240,14 +317,74 @@ def rgb_to_hsv_normalized(r, g, b):
     return h * 360, s, v
 
 
-def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map):
+def rgb_to_hsv_vectorized(rgb_array):
+    """
+    Vectorized RGB to HSV conversion using NumPy operations.
+    Much faster than individual colorsys calls.
+    
+    Args:
+        rgb_array: numpy array of shape (N, 3) with RGB values in range [0, 1]
+        
+    Returns:
+        numpy array of shape (N, 3) with HSV values
+    """
+    rgb = rgb_array
+    maxc = np.max(rgb, axis=1)
+    minc = np.min(rgb, axis=1)
+    
+    # Value is the maximum
+    v = maxc
+    
+    # Saturation
+    delta = maxc - minc
+    s = np.where(maxc != 0, delta / maxc, 0)
+    
+    # Hue
+    h = np.zeros(len(rgb))
+    
+    # Only calculate hue where there's color (delta > 0)
+    mask = delta != 0
+    
+    if np.any(mask):
+        rgb_masked = rgb[mask]
+        maxc_masked = maxc[mask]
+        delta_masked = delta[mask]
+        
+        # Red is max
+        red_max = (rgb_masked[:, 0] == maxc_masked)
+        h[mask] = np.where(red_max, 
+                          (rgb_masked[:, 1] - rgb_masked[:, 2]) / delta_masked,
+                          h[mask])
+        
+        # Green is max
+        green_max = (rgb_masked[:, 1] == maxc_masked) & ~red_max
+        h[mask] = np.where(green_max,
+                          2.0 + (rgb_masked[:, 2] - rgb_masked[:, 0]) / delta_masked,
+                          h[mask])
+        
+        # Blue is max
+        blue_max = (rgb_masked[:, 2] == maxc_masked) & ~red_max & ~green_max
+        h[mask] = np.where(blue_max,
+                          4.0 + (rgb_masked[:, 0] - rgb_masked[:, 1]) / delta_masked,
+                          h[mask])
+        
+        h[mask] = h[mask] / 6.0
+        h[mask] = np.where(h[mask] < 0, h[mask] + 1.0, h[mask])
+    
+    return np.column_stack((h, s, v))
+
+
+def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree=None):
     """
     Find the nearest wheel colors for multiple image colors using vectorized HSV-based matching.
     This properly maps colors based on hue (angle) and saturation (radius) like a real color wheel.
+    Uses cached HSV values for wheel colors to avoid recomputation.
     
     Args:
         image_colors (list): List of RGB color tuples from the image [(r,g,b), ...]
         color_to_pixels_map (dict): Mapping of wheel colors to pixel coordinates
+        wheel_hsv_cache (dict): Pre-computed HSV values for wheel colors {(r,g,b): [h,s,v]}
+        force_kdtree (bool): Force KD-tree usage (True), disable it (False), or auto-detect (None)
         
     Returns:
         dict: Mapping {image_color: nearest_wheel_color}
@@ -255,26 +392,106 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map):
     if not image_colors:
         return {}
     
-    # Convert image colors to HSV using vectorized operations
+    # Convert image colors to numpy array and normalize
     image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0  # Shape: (N, 3)
     
-    # Vectorized RGB to HSV conversion
-    image_hsv = np.zeros_like(image_colors_array)  # Shape: (N, 3)
-    for i in range(len(image_colors_array)):
-        image_hsv[i] = colorsys.rgb_to_hsv(*image_colors_array[i])
-    
-    # Convert wheel colors to HSV
+    # Get wheel colors and their cached HSV values
     wheel_colors = list(color_to_pixels_map.keys())
-    wheel_colors_array = np.array(wheel_colors, dtype=np.float32) / 255.0  # Shape: (M, 3)
     
-    wheel_hsv = np.zeros_like(wheel_colors_array)  # Shape: (M, 3)
-    for i in range(len(wheel_colors_array)):
-        wheel_hsv[i] = colorsys.rgb_to_hsv(*wheel_colors_array[i])
+    # Use cached HSV values for wheel colors (MUCH faster!)
+    wheel_hsv = np.array([wheel_hsv_cache[color] for color in wheel_colors])  # Shape: (M, 3)
     
+    # Vectorized RGB to HSV conversion for image colors only
+    image_hsv = rgb_to_hsv_vectorized(image_colors_array)  # Shape: (N, 3)
+    
+    # Determine whether to use KD-tree
+    if force_kdtree is True:
+        use_kdtree = KDTREE_AVAILABLE
+        if not KDTREE_AVAILABLE:
+            print("Warning: KD-tree requested but scikit-learn not available. Using fallback.")
+    elif force_kdtree is False:
+        use_kdtree = False
+    else:
+        # Auto-detect based on dataset size
+        use_kdtree = KDTREE_AVAILABLE and len(image_colors) > 100 and len(wheel_colors) > 500
+    
+    if use_kdtree:
+        print(f"Using KD-tree for {len(image_colors)} image colors vs {len(wheel_colors)} wheel colors")
+        return _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv)
+    else:
+        method = "KD-tree not available" if not KDTREE_AVAILABLE else f"vectorized (dataset size: {len(image_colors)}x{len(wheel_colors)})"
+        print(f"Using {method} for nearest neighbor search")
+        return _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv)
+
+
+def _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv):
+    """
+    Use KD-tree for efficient nearest neighbor search in HSV space with custom distance metric.
+    Handles hue wraparound properly by using a weighted Euclidean distance in a transformed space.
+    
+    Args:
+        image_colors (list): Original RGB color tuples
+        image_hsv (np.ndarray): HSV values for image colors (N, 3)
+        wheel_colors (list): Wheel RGB color tuples  
+        wheel_hsv (np.ndarray): HSV values for wheel colors (M, 3)
+        
+    Returns:
+        dict: Mapping {image_color: nearest_wheel_color}
+    """
+    # Transform HSV to handle hue wraparound and apply weights
+    # Convert hue to cartesian coordinates and apply weights
+    hue_weight = 3.0
+    sat_weight = 1.0  
+    val_weight = 0.5
+    
+    # Transform wheel HSV: hue -> (cos, sin), then apply weights
+    wheel_h_rad = wheel_hsv[:, 0] * 2 * np.pi  # Convert hue to radians
+    wheel_transformed = np.column_stack([
+        hue_weight * np.cos(wheel_h_rad),  # Hue X component (weighted)
+        hue_weight * np.sin(wheel_h_rad),  # Hue Y component (weighted)  
+        sat_weight * wheel_hsv[:, 1],      # Saturation (weighted)
+        val_weight * wheel_hsv[:, 2]       # Value (weighted)
+    ])
+    
+    # Transform image HSV the same way
+    image_h_rad = image_hsv[:, 0] * 2 * np.pi
+    image_transformed = np.column_stack([
+        hue_weight * np.cos(image_h_rad),
+        hue_weight * np.sin(image_h_rad),
+        sat_weight * image_hsv[:, 1],
+        val_weight * image_hsv[:, 2]
+    ])
+    
+    # Build KD-tree with transformed wheel colors
+    kdtree = KDTree(wheel_transformed, metric='euclidean')
+    
+    # Find nearest neighbors for all image colors at once
+    distances, indices = kdtree.query(image_transformed, k=1)
+    
+    # Create mapping dictionary
+    color_mapping = {}
+    for i, image_color in enumerate(image_colors):
+        nearest_wheel_color = wheel_colors[indices[i, 0]]  # indices shape is (N, 1)
+        color_mapping[image_color] = nearest_wheel_color
+    
+    return color_mapping
+
+
+def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv):
+    """
+    Fallback vectorized nearest neighbor search (original implementation).
+    Used when KD-tree is not available or dataset is small.
+    
+    Args:
+        image_colors (list): Original RGB color tuples
+        image_hsv (np.ndarray): HSV values for image colors (N, 3)
+        wheel_colors (list): Wheel RGB color tuples
+        wheel_hsv (np.ndarray): HSV values for wheel colors (M, 3)
+        
+    Returns:
+        dict: Mapping {image_color: nearest_wheel_color}
+    """
     # Vectorized HSV distance calculation with broadcasting
-    # image_hsv shape: (N, 3), wheel_hsv shape: (M, 3)
-    # After broadcasting: (N, 1, 3) - (1, M, 3) = (N, M, 3)
-    
     img_h = image_hsv[:, None, 0]  # Shape: (N, 1)
     img_s = image_hsv[:, None, 1]  # Shape: (N, 1) 
     img_v = image_hsv[:, None, 2]  # Shape: (N, 1)
@@ -312,7 +529,7 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map):
     return color_mapping
 
 
-def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
+def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None):
     """
     Create a full color wheel where opacity represents color frequency.
     Areas with frequent colors are more opaque.
@@ -325,12 +542,13 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         wheel_size (int): Size of the output wheel image
         inner_radius_ratio (float): Ratio of inner radius to outer radius
         quantize_level (int): Color quantization level used in analysis
+        force_kdtree (bool): Force KD-tree usage (True), disable it (False), or auto-detect (None)
         
     Returns:
         tuple: (numpy.ndarray, dict, list) - RGBA image of the color wheel, normalized percentages, and opacity values
     """
-    # Load or create the wheel template (cached on disk)
-    wheel_rgb, color_to_pixels_map = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
+    # Load or create the wheel template (cached on disk) WITH HSV cache
+    wheel_rgb, color_to_pixels_map, wheel_hsv_cache = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
     
     # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
@@ -339,22 +557,30 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     # Find max percentage for normalization
     max_percentage = max(color_percentages.values()) if color_percentages else 1.0
     
-    # Normalize all percentages so max becomes 1.0 (for full opacity)
-    normalized_percentages = {}
-    for color, percentage in color_percentages.items():
-        normalized_percentages[color] = percentage / max_percentage
+    # Pre-allocate arrays for normalized percentages
+    image_colors = list(color_percentages.keys())
+    percentages_array = np.array(list(color_percentages.values()), dtype=np.float32)
+    normalized_percentages_array = percentages_array / max_percentage
     
-    # Collect opacity values for histogram
-    opacity_values = []
+    # Create normalized percentages dictionary 
+    normalized_percentages = {}
+    for i, color in enumerate(image_colors):
+        normalized_percentages[color] = normalized_percentages_array[i]
+    
+    # Pre-allocate opacity values list with estimated size
+    estimated_wheel_colors = min(len(color_to_pixels_map), len(image_colors) * 2)  # Rough estimate
+    opacity_values = []  # Python lists grow dynamically, no need to pre-reserve
     
     # NEW APPROACH: Map each input image color to the nearest color in the wheel template
     # VECTORIZED: Do all color mappings at once for massive speed improvement
+    # CACHED: Use pre-computed HSV values for wheel colors
+    # SPATIAL INDEXING: Use KD-tree for large datasets
     wheel_color_frequencies = {}
     
-    # Get all image colors and do vectorized nearest-neighbor lookup
+    # Get all image colors and do vectorized nearest-neighbor lookup using cached HSV
     image_colors = list(normalized_percentages.keys())
     if image_colors:
-        color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map)
+        color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree)
         
         # Accumulate frequencies for wheel colors
         for image_color, percentage in normalized_percentages.items():
@@ -402,8 +628,8 @@ def add_wheel_gradient(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8)
     Returns:
         numpy.ndarray: RGBA image of a standard color wheel
     """
-    # Load or create the wheel template (cached on disk)
-    wheel_rgb, _ = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
+    # Load or create the wheel template (cached on disk) - ignore HSV cache for reference wheel
+    wheel_rgb, _, _ = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
     
     # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
@@ -465,54 +691,77 @@ def create_color_spectrum_histogram(color_percentages, output_path, width=1200, 
     """
     # Create a complete color spectrum (like HSV color wheel flattened)
     spectrum_width = 360  # One bar per degree of hue
-    spectrum_colors = []
-    frequencies = []
     
-    # Generate full spectrum colors (HSV with full saturation and value)
-    for hue in range(spectrum_width):
-        # Convert HSV to RGB for this hue (full saturation and value)
-        h = hue / 360.0
-        s = 1.0  # Full saturation
-        v = 1.0  # Full value/brightness
+    # Pre-allocate arrays for spectrum data
+    spectrum_colors = np.zeros((spectrum_width, 3), dtype=np.float32)
+    frequencies = np.zeros(spectrum_width, dtype=np.float32)
+    
+    # VECTORIZED: Generate full spectrum colors (HSV with full saturation and value)
+    hue_degrees = np.arange(spectrum_width, dtype=np.float32)
+    spectrum_hsv = np.column_stack([
+        hue_degrees / 360.0,  # H: 0-1
+        np.ones(spectrum_width, dtype=np.float32),  # S: 1.0 (full saturation)
+        np.ones(spectrum_width, dtype=np.float32)   # V: 1.0 (full value)
+    ])
+    
+    # Convert spectrum HSV to RGB using vectorized conversion
+    def hsv_to_rgb_vectorized_simple(hsv_array):
+        h, s, v = hsv_array[:, 0], hsv_array[:, 1], hsv_array[:, 2]
         
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        spectrum_rgb = (int(r * 255), int(g * 255), int(b * 255))
-        spectrum_colors.append(spectrum_rgb)
+        c = v * s
+        x = c * (1 - np.abs(((h * 6) % 2) - 1))
+        m = v - c
         
-        # Find if this color (or similar) exists in the image
-        # We need to find the closest match since exact matches are unlikely
-        closest_frequency = 0
+        # Pre-allocate RGB arrays
+        r = np.zeros_like(h)
+        g = np.zeros_like(h)
+        b = np.zeros_like(h)
         
-        # Look for colors in the image that are close to this spectrum color
-        for image_color, freq in color_percentages.items():
-            # Convert image color to HSV to compare hue
-            img_r, img_g, img_b = [x/255.0 for x in image_color]
-            img_h, img_s, img_v = colorsys.rgb_to_hsv(img_r, img_g, img_b)
-            img_hue = img_h * 360
+        # Determine RGB based on hue sector
+        h_sector = (h * 6).astype(int) % 6
+        
+        mask0 = h_sector == 0; r[mask0] = c[mask0]; g[mask0] = x[mask0]
+        mask1 = h_sector == 1; r[mask1] = x[mask1]; g[mask1] = c[mask1]
+        mask2 = h_sector == 2; g[mask2] = c[mask2]; b[mask2] = x[mask2]
+        mask3 = h_sector == 3; g[mask3] = x[mask3]; b[mask3] = c[mask3]
+        mask4 = h_sector == 4; r[mask4] = x[mask4]; b[mask4] = c[mask4]
+        mask5 = h_sector == 5; r[mask5] = c[mask5]; b[mask5] = x[mask5]
+        
+        return np.column_stack([r + m, g + m, b + m])
+    
+    spectrum_colors = hsv_to_rgb_vectorized_simple(spectrum_hsv)
+    
+    # VECTORIZED: Convert all image colors to HSV at once if there are any
+    if color_percentages:
+        image_colors = list(color_percentages.keys())
+        image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0
+        image_hsv = rgb_to_hsv_vectorized(image_colors_array)
+        image_hues = image_hsv[:, 0] * 360  # Convert to degrees
+        image_sats = image_hsv[:, 1]
+        frequencies_array = np.array(list(color_percentages.values()), dtype=np.float32)
+        
+        # Find frequencies for each spectrum hue using vectorized operations
+        for i, spectrum_hue in enumerate(hue_degrees):
+            # Calculate hue differences with wraparound
+            hue_diffs = np.abs(image_hues - spectrum_hue)
+            hue_diffs = np.minimum(hue_diffs, 360 - hue_diffs)
             
-            # Check if hues are close (within a few degrees)
-            hue_diff = abs(img_hue - hue)
-            # Handle wraparound (e.g., 359° vs 1°)
-            hue_diff = min(hue_diff, 360 - hue_diff)
+            # Find colors within threshold
+            hue_mask = (hue_diffs <= 2) & (image_sats > 0.3)  # Within 2 degrees and not too gray
             
-            # If hue is close and color has reasonable saturation, include its frequency
-            if hue_diff <= 2 and img_s > 0.3:  # Within 2 degrees and not too gray
-                closest_frequency = max(closest_frequency, freq)
-        
-        frequencies.append(closest_frequency)
+            if np.any(hue_mask):
+                frequencies[i] = np.max(frequencies_array[hue_mask])
     
     # Create the plot
     fig, ax = plt.subplots(figsize=(width/100, height/100))
     
     # Create bars with spectrum colors
-    x_positions = range(len(spectrum_colors))
+    x_positions = np.arange(len(spectrum_colors))
     bars = ax.bar(x_positions, frequencies, width=1.0, edgecolor='none')
     
     # Set bar colors to match the spectrum colors
     for i, (bar, rgb_color) in enumerate(zip(bars, spectrum_colors)):
-        # Normalize RGB to 0-1 range for matplotlib
-        normalized_color = [c/255.0 for c in rgb_color]
-        bar.set_facecolor(normalized_color)
+        bar.set_facecolor(rgb_color)  # Already in 0-1 range
     
     # Customize the plot
     ax.set_xlim(-0.5, len(spectrum_colors) - 0.5)
@@ -531,10 +780,10 @@ def create_color_spectrum_histogram(color_percentages, output_path, width=1200, 
     ax.set_axisbelow(True)
     
     # Add statistics
-    non_zero_freqs = [f for f in frequencies if f > 0]
+    non_zero_freqs = frequencies[frequencies > 0]
     total_colors_in_image = len(non_zero_freqs)
-    max_freq = max(frequencies) if frequencies else 0
-    avg_freq = np.mean(non_zero_freqs) if non_zero_freqs else 0
+    max_freq = np.max(frequencies) if len(frequencies) > 0 else 0
+    avg_freq = np.mean(non_zero_freqs) if len(non_zero_freqs) > 0 else 0
     
     stats_text = f'Colors in Image: {total_colors_in_image}/{spectrum_width}\nMax Frequency: {max_freq:.4f}\nAvg Frequency: {avg_freq:.4f}'
     ax.text(0.98, 0.98, stats_text, transform=ax.transAxes, 
@@ -576,74 +825,128 @@ def create_circular_color_spectrum(color_percentages, output_path, size=800):
     inner_radius = 0.3  # Inner circle radius
     max_spike_length = 0.6  # Maximum spike length
     
-    # Calculate frequencies for each hue
-    frequencies = []
-    spectrum_colors = []
+    # VECTORIZED: Convert all image colors to HSV at once
+    if color_percentages:
+        image_colors = list(color_percentages.keys())
+        image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0
+        image_hsv = rgb_to_hsv_vectorized(image_colors_array)  # Shape: (N, 3)
+        image_hues = image_hsv[:, 0] * 360  # Convert to degrees
+        image_sats = image_hsv[:, 1]
+        frequencies_array = np.array(list(color_percentages.values()), dtype=np.float32)
+    else:
+        image_hues = np.array([])
+        image_sats = np.array([])
+        frequencies_array = np.array([])
     
-    for hue in range(num_segments):
-        # Convert HSV to RGB for this hue
-        h = hue / 360.0
-        s = 1.0  # Full saturation
-        v = 1.0  # Full value/brightness
+    # VECTORIZED: Generate spectrum colors
+    hue_degrees = np.arange(num_segments, dtype=np.float32)
+    spectrum_hsv = np.column_stack([
+        hue_degrees / 360.0,  # H: 0-1
+        np.ones(num_segments, dtype=np.float32),  # S: 1.0 (full saturation)
+        np.ones(num_segments, dtype=np.float32)   # V: 1.0 (full value)
+    ])
+    
+    # Convert spectrum HSV to RGB using our vectorized function
+    # Note: rgb_to_hsv_vectorized works in reverse too, but we need HSV->RGB
+    # Let's use a vectorized HSV to RGB conversion
+    def hsv_to_rgb_vectorized(hsv_array):
+        h, s, v = hsv_array[:, 0], hsv_array[:, 1], hsv_array[:, 2]
         
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        spectrum_rgb = (r, g, b)  # Keep as 0-1 for matplotlib
-        spectrum_colors.append(spectrum_rgb)
+        c = v * s
+        x = c * (1 - np.abs(((h * 6) % 2) - 1))
+        m = v - c
         
-        # Find frequency for this hue
-        closest_frequency = 0
-        for image_color, freq in color_percentages.items():
-            img_r, img_g, img_b = [x/255.0 for x in image_color]
-            img_h, img_s, img_v = colorsys.rgb_to_hsv(img_r, img_g, img_b)
-            img_hue = img_h * 360
+        # Initialize RGB arrays
+        r = np.zeros_like(h)
+        g = np.zeros_like(h)
+        b = np.zeros_like(h)
+        
+        # Determine RGB based on hue sector
+        h_sector = (h * 6).astype(int) % 6
+        
+        mask0 = h_sector == 0
+        r[mask0] = c[mask0]
+        g[mask0] = x[mask0]
+        
+        mask1 = h_sector == 1
+        r[mask1] = x[mask1]
+        g[mask1] = c[mask1]
+        
+        mask2 = h_sector == 2
+        g[mask2] = c[mask2]
+        b[mask2] = x[mask2]
+        
+        mask3 = h_sector == 3
+        g[mask3] = x[mask3]
+        b[mask3] = c[mask3]
+        
+        mask4 = h_sector == 4
+        r[mask4] = x[mask4]
+        b[mask4] = c[mask4]
+        
+        mask5 = h_sector == 5
+        r[mask5] = c[mask5]
+        b[mask5] = x[mask5]
+        
+        return np.column_stack([r + m, g + m, b + m])
+    
+    spectrum_rgb = hsv_to_rgb_vectorized(spectrum_hsv)  # Shape: (360, 3)
+    
+    # VECTORIZED: Calculate frequencies for each spectrum hue
+    frequencies = np.zeros(num_segments, dtype=np.float32)
+    
+    if len(image_hues) > 0:
+        # For each spectrum hue, find matching image colors
+        for i, spectrum_hue in enumerate(hue_degrees):
+            # Calculate hue differences with wraparound
+            hue_diffs = np.abs(image_hues - spectrum_hue)
+            hue_diffs = np.minimum(hue_diffs, 360 - hue_diffs)
             
-            hue_diff = abs(img_hue - hue)
-            hue_diff = min(hue_diff, 360 - hue_diff)
+            # Find colors within threshold
+            hue_mask = (hue_diffs <= 2) & (image_sats > 0.1)  # Within 2 degrees and not too desaturated
             
-            # Include more desaturated colors (like sky blues) by lowering saturation threshold
-            if hue_diff <= 2 and img_s > 0.1:  # Lowered from 0.3 to 0.1
-                closest_frequency = max(closest_frequency, freq)
-        
-        frequencies.append(closest_frequency)
+            if np.any(hue_mask):
+                frequencies[i] = np.max(frequencies_array[hue_mask])
     
     # Normalize frequencies for spike lengths
-    max_freq = max(frequencies) if frequencies and max(frequencies) > 0 else 1
-    normalized_freqs = [f / max_freq for f in frequencies]
+    max_freq = np.max(frequencies) if np.any(frequencies > 0) else 1
+    normalized_freqs = frequencies / max_freq
     
-    # Draw the circular spectrum with spikes
+    # VECTORIZED: Calculate all angles and positions at once
+    angles_rad = hue_degrees * np.pi / 180  # Convert to radians
+    cos_angles = np.cos(angles_rad)
+    sin_angles = np.sin(angles_rad)
+    
+    # Calculate all spike positions
+    inner_x = inner_radius * cos_angles
+    inner_y = inner_radius * sin_angles
+    spike_lengths = normalized_freqs * max_spike_length
+    outer_x = (inner_radius + spike_lengths) * cos_angles
+    outer_y = (inner_radius + spike_lengths) * sin_angles
+    
+    # Draw spikes (only for non-zero frequencies to avoid clutter)
+    spike_mask = spike_lengths > 0
+    if np.any(spike_mask):
+        for i in np.where(spike_mask)[0]:
+            ax.plot([inner_x[i], outer_x[i]], [inner_y[i], outer_y[i]], 
+                   color=spectrum_rgb[i], linewidth=2, alpha=0.8)
+    
+    # VECTORIZED: Draw inner circle segments
+    segment_width = 2 * np.pi / num_segments
     for i in range(num_segments):
-        # Calculate angle (start from right at 0°, go counter-clockwise)
-        angle = i * np.pi / 180  # Convert to radians, start from right (0°), go counter-clockwise
-        
-        # Calculate spike length
-        spike_length = normalized_freqs[i] * max_spike_length
-        
-        # Calculate positions
-        inner_x = inner_radius * np.cos(angle)
-        inner_y = inner_radius * np.sin(angle)
-        outer_x = (inner_radius + spike_length) * np.cos(angle)
-        outer_y = (inner_radius + spike_length) * np.sin(angle)
-        
-        # Draw the spike (line from inner circle to outer point)
-        if spike_length > 0:
-            ax.plot([inner_x, outer_x], [inner_y, outer_y], 
-                   color=spectrum_colors[i], linewidth=2, alpha=0.8)
-        
-        # Draw a small segment of the inner circle with the spectrum color
-        segment_width = 2 * np.pi / num_segments
-        angle_start = angle - segment_width/2
-        angle_end = angle + segment_width/2
+        angle_start = angles_rad[i] - segment_width/2
+        angle_end = angles_rad[i] + segment_width/2
         
         # Create a small arc for the inner circle
         arc_angles = np.linspace(angle_start, angle_end, 5)
         arc_x = inner_radius * np.cos(arc_angles)
         arc_y = inner_radius * np.sin(arc_angles)
-        ax.plot(arc_x, arc_y, color=spectrum_colors[i], linewidth=3)
+        ax.plot(arc_x, arc_y, color=spectrum_rgb[i], linewidth=3)
     
     # Add title and statistics
-    non_zero_freqs = [f for f in frequencies if f > 0]
+    non_zero_freqs = frequencies[frequencies > 0]
     total_colors = len(non_zero_freqs)
-    avg_freq = np.mean(non_zero_freqs) if non_zero_freqs else 0
+    avg_freq = np.mean(non_zero_freqs) if len(non_zero_freqs) > 0 else 0
     
     ax.set_title(f'Circular Color Spectrum\n{total_colors} colors detected, Max frequency: {max_freq:.4f}', 
                 fontsize=14, pad=20)
@@ -676,8 +979,22 @@ def main():
                        help="Also generate a color spectrum histogram showing colors and their frequencies")
     parser.add_argument("--circular-spectrum", action="store_true",
                        help="Also generate a circular color spectrum with frequency spikes radiating outward")
+    parser.add_argument("--force-kdtree", action="store_true",
+                       help="Force KD-tree usage for nearest neighbor search (requires scikit-learn)")
+    parser.add_argument("--no-kdtree", action="store_true",
+                       help="Disable KD-tree and use vectorized fallback method")
     
     args = parser.parse_args()
+    
+    # Handle KD-tree options
+    force_kdtree = None
+    if args.force_kdtree and args.no_kdtree:
+        print("Error: Cannot specify both --force-kdtree and --no-kdtree")
+        return 1
+    elif args.force_kdtree:
+        force_kdtree = True
+    elif args.no_kdtree:
+        force_kdtree = False
     
     try:
         print(f"Loading and analyzing image: {args.input_image}")
@@ -685,7 +1002,7 @@ def main():
         print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
         
         print("Generating color wheel...")
-        wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize)
+        wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree)
         
         # Handle output format
         if args.format == "jpg":
