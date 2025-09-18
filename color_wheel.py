@@ -17,6 +17,7 @@ import math
 import matplotlib.pyplot as plt
 import pickle
 import os
+import time
 import multiprocessing as mp
 from functools import partial
 try:
@@ -34,6 +35,121 @@ except ImportError:
     NUMBA_AVAILABLE = False
     print("Warning: numba not available. Using standard NumPy operations.")
     print("For better performance with numerical computations, install numba: pip install numba")
+
+try:
+    import colour
+    COLOUR_SCIENCE_AVAILABLE = True
+except ImportError:
+    COLOUR_SCIENCE_AVAILABLE = False
+    print("Warning: colour-science not available. Adobe RGB conversion not supported.")
+    print("For Adobe RGB support, install colour-science: pip install colour-science")
+
+
+def format_time(seconds):
+    """Format time in a human-readable way."""
+    if seconds < 1:
+        return f"{seconds*1000:.1f}ms"
+    elif seconds < 60:
+        return f"{seconds:.2f}s"
+    else:
+        minutes = int(seconds // 60)
+        remaining_seconds = seconds % 60
+        return f"{minutes}m {remaining_seconds:.1f}s"
+
+
+def convert_adobe_rgb_to_srgb(image_rgb):
+    """
+    Convert Adobe RGB image to sRGB using colour-science library.
+    
+    Args:
+        image_rgb (numpy.ndarray): RGB image in Adobe RGB color space, values 0-255
+        
+    Returns:
+        numpy.ndarray: RGB image converted to sRGB color space, values 0-255
+    """
+    if not COLOUR_SCIENCE_AVAILABLE:
+        print("Warning: colour-science not available. Cannot convert Adobe RGB.")
+        print("Using image as-is (assuming sRGB). Install colour-science for proper conversion.")
+        return image_rgb
+    
+    try:
+        # Normalize to 0-1 range for colour-science
+        normalized = image_rgb.astype(np.float64) / 255.0
+        
+        # Convert from Adobe RGB to XYZ, then XYZ to sRGB
+        # Adobe RGB uses D65 illuminant and 2.2 gamma
+        xyz = colour.RGB_to_XYZ(
+            normalized,
+            colourspace=colour.RGB_COLOURSPACES['Adobe RGB (1998)'],
+            illuminant=colour.RGB_COLOURSPACES['Adobe RGB (1998)'].whitepoint
+        )
+        
+        srgb = colour.XYZ_to_RGB(
+            xyz,
+            colourspace=colour.RGB_COLOURSPACES['sRGB'],
+            illuminant=colour.RGB_COLOURSPACES['sRGB'].whitepoint
+        )
+        
+        # Clamp to valid range and convert back to 0-255
+        srgb = np.clip(srgb, 0, 1)
+        return (srgb * 255).astype(np.uint8)
+        
+    except Exception as e:
+        print(f"Warning: Adobe RGB conversion failed: {e}")
+        print("Using image as-is (assuming sRGB)")
+        return image_rgb
+
+
+def convert_adobe_rgb_matrix_method(image_rgb):
+    """
+    Fallback Adobe RGB to sRGB conversion using transformation matrix.
+    This is less accurate than the colour-science method but works without dependencies.
+    
+    Args:
+        image_rgb (numpy.ndarray): RGB image in Adobe RGB color space, values 0-255
+        
+    Returns:
+        numpy.ndarray: RGB image converted to sRGB color space, values 0-255
+    """
+    # Adobe RGB to XYZ matrix (D65 illuminant)
+    adobe_to_xyz = np.array([
+        [0.5767309, 0.1855540, 0.1881852],
+        [0.2973769, 0.6273491, 0.0752741],
+        [0.0270343, 0.0706872, 0.9911085]
+    ])
+    
+    # XYZ to sRGB matrix (D65 illuminant)
+    xyz_to_srgb = np.array([
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252]
+    ])
+    
+    # Combine matrices: Adobe RGB -> XYZ -> sRGB
+    conversion_matrix = np.dot(xyz_to_srgb, adobe_to_xyz)
+    
+    # Normalize input to 0-1
+    normalized = image_rgb.astype(np.float64) / 255.0
+    
+    # Apply gamma correction (Adobe RGB uses 2.2 gamma)
+    linearized = np.power(normalized, 2.2)
+    
+    # Apply color space conversion
+    original_shape = linearized.shape
+    linearized_flat = linearized.reshape(-1, 3)
+    converted_flat = np.dot(linearized_flat, conversion_matrix.T)
+    converted = converted_flat.reshape(original_shape)
+    
+    # Apply sRGB gamma correction
+    srgb_linear = np.where(
+        converted <= 0.0031308,
+        12.92 * converted,
+        1.055 * np.power(converted, 1.0/2.4) - 0.055
+    )
+    
+    # Clamp to valid range and convert back to 0-255
+    srgb_linear = np.clip(srgb_linear, 0, 1)
+    return (srgb_linear * 255).astype(np.uint8)
 
 
 def create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
@@ -260,7 +376,7 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quanti
         return template_data
 
 
-def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_parallel=None):
+def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_parallel=None, color_space="sRGB"):
     """
     Load an image and analyze color frequencies as percentages.
     
@@ -269,6 +385,7 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_pa
         sample_factor (int): Factor to downsample image for faster processing
         quantize_level (int): Color quantization level (1=no quantization, higher=more grouping)
         use_parallel (bool): Use parallel processing for large images (None=auto-detect)
+        color_space (str): Color space to use ("sRGB", "Adobe RGB", "ProPhoto RGB")
         
     Returns:
         dict: Color frequency percentages {(r,g,b): percentage}
@@ -281,6 +398,26 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_pa
     # Convert BGR to RGB
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
+    # Handle different color spaces
+    if color_space.lower() == "adobe rgb" or color_space.lower() == "adobergb":
+        print("Converting from Adobe RGB to sRGB for processing...")
+        conversion_start = time.time()
+        if COLOUR_SCIENCE_AVAILABLE:
+            print("Using colour-science library for accurate conversion")
+            image = convert_adobe_rgb_to_srgb(image)
+        else:
+            print("Using matrix-based conversion (colour-science not available)")
+            image = convert_adobe_rgb_matrix_method(image)
+        conversion_time = time.time() - conversion_start
+        print(f"Color space conversion completed in {format_time(conversion_time)}")
+    elif color_space.lower() == "prophoto rgb" or color_space.lower() == "prophotorgb":
+        print("Warning: ProPhoto RGB conversion not yet implemented.")
+        print("ProPhoto RGB has an even wider color gamut than Adobe RGB.")
+        print("Processing as sRGB - colors may be inaccurate.")
+    else:
+        # Default sRGB - most common case
+        pass
+    
     # Downsample for faster processing
     if sample_factor > 1:
         height, width = image.shape[:2]
@@ -292,23 +429,31 @@ def load_and_analyze_image(image_path, sample_factor=4, quantize_level=8, use_pa
     total_pixels = len(pixels)
     
     print(f"Analyzing {total_pixels:,} pixels...")
+    analysis_start = time.time()
     
     # Determine if we should use parallel processing
     if use_parallel is None:
         use_parallel = total_pixels > 1_000_000  # Use parallel for images > 1M pixels
     
     # Quantize colors to reduce noise (group similar colors) - vectorized
+    quantize_start = time.time()
     if quantize_level > 1:
         quantized_pixels = (pixels // quantize_level) * quantize_level
     else:
         quantized_pixels = pixels  # No quantization
+    quantize_time = time.time() - quantize_start
     
+    color_counting_start = time.time()
     if use_parallel and total_pixels > 500_000:
         print("Using parallel processing for color analysis...")
         color_percentages = _analyze_colors_parallel(quantized_pixels, total_pixels)
     else:
         print("Using single-threaded color analysis...")
         color_percentages = _analyze_colors_single(quantized_pixels, total_pixels)
+    color_counting_time = time.time() - color_counting_start
+    
+    analysis_time = time.time() - analysis_start
+    print(f"Color analysis completed in {format_time(analysis_time)} (quantization: {format_time(quantize_time)}, counting: {format_time(color_counting_time)})")
     
     return color_percentages
 
@@ -549,18 +694,21 @@ def find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, whee
     elif force_kdtree is False:
         use_kdtree = False
     else:
-        # Auto-detect based on dataset size
-        use_kdtree = KDTREE_AVAILABLE and len(image_colors) > 100 and len(wheel_colors) > 500
+        # Auto-detect based on dataset size - more aggressive thresholds for better performance
+        use_kdtree = KDTREE_AVAILABLE and (len(image_colors) > 50 or len(wheel_colors) > 200)
+    
+    # Debug: Show what method will be used
+    print(f"Nearest neighbor search: {len(image_colors):,} image colors vs {len(wheel_colors):,} wheel colors")
     
     if use_kdtree:
-        print(f"Using KD-tree for {len(image_colors)} image colors vs {len(wheel_colors)} wheel colors")
+        print(f"Using KD-tree for nearest neighbor search (faster for large datasets)")
         return _find_nearest_with_kdtree(image_colors, image_hsv, wheel_colors, wheel_hsv)
     else:
         method_parts = []
         if not KDTREE_AVAILABLE:
             method_parts.append("KD-tree not available")
         else:
-            method_parts.append(f"vectorized (dataset size: {len(image_colors)}x{len(wheel_colors)})")
+            method_parts.append(f"vectorized fallback")
         
         if NUMBA_AVAILABLE and len(image_colors) * len(wheel_colors) > 10000:
             method_parts.append("with JIT compilation")
@@ -664,8 +812,9 @@ def _calculate_hsv_distances_numba(image_hsv, wheel_hsv, hue_weight=3.0, sat_wei
 
 def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv):
     """
-    Fallback vectorized nearest neighbor search (original implementation).
+    Fallback vectorized nearest neighbor search with chunked processing.
     Used when KD-tree is not available or dataset is small.
+    Uses chunking to avoid memory issues with very large datasets.
     
     Args:
         image_colors (list): Original RGB color tuples
@@ -676,46 +825,64 @@ def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, whe
     Returns:
         dict: Mapping {image_color: nearest_wheel_color}
     """
-    # Use JIT-compiled version if available and dataset is large enough
-    if NUMBA_AVAILABLE and len(image_colors) * len(wheel_colors) > 10000:
-        print("Using JIT-compiled distance calculation...")
-        distances = _calculate_hsv_distances_numba(image_hsv, wheel_hsv)
-    else:
-        # Original NumPy broadcasting approach
-        # Vectorized HSV distance calculation with broadcasting
-        img_h = image_hsv[:, None, 0]  # Shape: (N, 1)
-        img_s = image_hsv[:, None, 1]  # Shape: (N, 1) 
-        img_v = image_hsv[:, None, 2]  # Shape: (N, 1)
-        
-        wheel_h = wheel_hsv[None, :, 0]  # Shape: (1, M)
-        wheel_s = wheel_hsv[None, :, 1]  # Shape: (1, M)
-        wheel_v = wheel_hsv[None, :, 2]  # Shape: (1, M)
-        
-        # Calculate hue differences with proper wraparound
-        hue_diff = np.abs(img_h - wheel_h)  # Shape: (N, M)
-        hue_diff = np.minimum(hue_diff, 1 - hue_diff)  # Handle wraparound
-        
-        # Calculate saturation and value differences
-        sat_diff = img_s - wheel_s  # Shape: (N, M)
-        val_diff = img_v - wheel_v  # Shape: (N, M)
-        
-        # Weighted distance calculation (vectorized)
-        hue_weight = 3.0    # Hue is most important for wheel position
-        sat_weight = 1.0    # Saturation determines distance from center
-        val_weight = 0.5    # Value is less important for wheel mapping
-        
-        distances = (hue_weight * hue_diff**2 + 
-                    sat_weight * sat_diff**2 + 
-                    val_weight * val_diff**2)  # Shape: (N, M)
+    num_image_colors = len(image_colors)
+    num_wheel_colors = len(wheel_colors)
+    total_comparisons = num_image_colors * num_wheel_colors
     
-    # Find nearest wheel color for each image color
-    nearest_indices = np.argmin(distances, axis=1)  # Shape: (N,)
+    # For very large datasets, use chunked processing to avoid memory issues
+    # Memory usage for full distance matrix: N*M*8 bytes (float64)
+    max_chunk_comparisons = 50_000_000  # ~400MB memory limit
+    chunk_size = min(max_chunk_comparisons // num_wheel_colors, num_image_colors)
+    chunk_size = max(100, chunk_size)  # Minimum chunk size
     
-    # Create mapping dictionary
+    print(f"Processing {total_comparisons:,} total comparisons in chunks of {chunk_size:,} image colors")
+    
     color_mapping = {}
-    for i, image_color in enumerate(image_colors):
-        nearest_wheel_color = wheel_colors[nearest_indices[i]]
-        color_mapping[image_color] = nearest_wheel_color
+    
+    # Process in chunks to manage memory usage
+    for start_idx in range(0, num_image_colors, chunk_size):
+        end_idx = min(start_idx + chunk_size, num_image_colors)
+        chunk_image_hsv = image_hsv[start_idx:end_idx]
+        chunk_size_actual = end_idx - start_idx
+        
+        # Use JIT-compiled version if available and chunk is large enough
+        if NUMBA_AVAILABLE and chunk_size_actual * num_wheel_colors > 10000:
+            distances = _calculate_hsv_distances_numba(chunk_image_hsv, wheel_hsv)
+        else:
+            # NumPy broadcasting approach for this chunk
+            img_h = chunk_image_hsv[:, None, 0]  # Shape: (chunk_size, 1)
+            img_s = chunk_image_hsv[:, None, 1]  # Shape: (chunk_size, 1) 
+            img_v = chunk_image_hsv[:, None, 2]  # Shape: (chunk_size, 1)
+            
+            wheel_h = wheel_hsv[None, :, 0]  # Shape: (1, M)
+            wheel_s = wheel_hsv[None, :, 1]  # Shape: (1, M)
+            wheel_v = wheel_hsv[None, :, 2]  # Shape: (1, M)
+            
+            # Calculate hue differences with proper wraparound
+            hue_diff = np.abs(img_h - wheel_h)  # Shape: (chunk_size, M)
+            hue_diff = np.minimum(hue_diff, 1 - hue_diff)  # Handle wraparound
+            
+            # Calculate saturation and value differences
+            sat_diff = img_s - wheel_s  # Shape: (chunk_size, M)
+            val_diff = img_v - wheel_v  # Shape: (chunk_size, M)
+            
+            # Weighted distance calculation (vectorized)
+            hue_weight = 3.0    # Hue is most important for wheel position
+            sat_weight = 1.0    # Saturation determines distance from center
+            val_weight = 0.5    # Value is less important for wheel mapping
+            
+            distances = (hue_weight * hue_diff**2 + 
+                        sat_weight * sat_diff**2 + 
+                        val_weight * val_diff**2)  # Shape: (chunk_size, M)
+        
+        # Find nearest wheel color for each image color in this chunk
+        nearest_indices = np.argmin(distances, axis=1)  # Shape: (chunk_size,)
+        
+        # Create mapping for this chunk
+        for i, nearest_idx in enumerate(nearest_indices):
+            image_color = image_colors[start_idx + i]
+            nearest_wheel_color = wheel_colors[nearest_idx]
+            color_mapping[image_color] = nearest_wheel_color
     
     return color_mapping
 
@@ -739,8 +906,12 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     Returns:
         tuple: (numpy.ndarray, dict, list) - RGBA image of the color wheel, normalized percentages, and opacity values
     """
+    wheel_start = time.time()
+    
     # Load or create the wheel template (cached on disk) WITH HSV cache
+    template_start = time.time()
     wheel_rgb, color_to_pixels_map, wheel_hsv_cache = load_or_create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
+    template_time = time.time() - template_start
     
     # Create output image (RGBA) - start with RGB template
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
@@ -773,7 +944,9 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     # Get all image colors and do vectorized nearest-neighbor lookup using cached HSV
     image_colors = list(normalized_percentages.keys())
     if image_colors:
+        nearest_neighbor_start = time.time()
         color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+        nearest_neighbor_time = time.time() - nearest_neighbor_start
         
         # Accumulate frequencies for wheel colors
         for image_color, percentage in normalized_percentages.items():
@@ -790,6 +963,7 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         wheel_color_frequencies[wheel_color] /= max_accumulated_freq
     
     # Now apply frequencies to the wheel using the mapped colors
+    opacity_mapping_start = time.time()
     for quantized_color, pixel_coords in color_to_pixels_map.items():
         # Get the accumulated frequency for this wheel color
         normalized_frequency = wheel_color_frequencies.get(quantized_color, 0)
@@ -809,6 +983,10 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
             y_coords = pixel_coords[:, 0]
             x_coords = pixel_coords[:, 1]
             wheel[y_coords, x_coords, 3] = opacity
+    opacity_mapping_time = time.time() - opacity_mapping_start
+    
+    wheel_time = time.time() - wheel_start
+    print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, nearest-neighbor: {format_time(nearest_neighbor_time) if image_colors else '0ms'}, opacity mapping: {format_time(opacity_mapping_time)})")
             
     return wheel, normalized_percentages, opacity_values
 
@@ -1180,6 +1358,8 @@ def main():
                        help="Force parallel processing for color analysis and computations")
     parser.add_argument("--no-parallel", action="store_true",
                        help="Disable parallel processing and use single-threaded methods")
+    parser.add_argument("--color-space", choices=["sRGB", "Adobe RGB", "ProPhoto RGB"], default="sRGB",
+                       help="Color space to assume for input image (default: sRGB)")
     
     args = parser.parse_args()
     
@@ -1216,17 +1396,29 @@ def main():
         print(f"Available optimizations: {', '.join(optimizations)}")
     
     try:
+        total_start = time.time()
+        
         print(f"Loading and analyzing image: {args.input_image}")
-        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize, use_parallel)
+        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize, use_parallel, args.color_space)
         print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
         
         print("Generating color wheel...")
         wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree, use_parallel=use_parallel)
         
+        # Auto-detect format from file extension if not explicitly specified
+        output_path = args.output_wheel
+        if args.format == "png" and (output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg')):
+            print("Auto-detected JPG format from file extension")
+            format_to_use = "jpg"
+        elif args.format == "jpg" and output_path.lower().endswith('.png'):
+            print("Auto-detected PNG format from file extension")
+            format_to_use = "png"
+        else:
+            format_to_use = args.format
+        
         # Handle output format
-        if args.format == "jpg":
+        if format_to_use == "jpg":
             # JPG doesn't support transparency, so blend with black background
-            output_path = args.output_wheel
             if not output_path.lower().endswith('.jpg') and not output_path.lower().endswith('.jpeg'):
                 output_path = output_path.rsplit('.', 1)[0] + '.jpg'
                 print(f"Changed output format to JPG: {output_path}")
@@ -1244,7 +1436,6 @@ def main():
             
         else:  # PNG format
             # Ensure output filename has .png extension for RGBA support
-            output_path = args.output_wheel
             if not output_path.lower().endswith('.png'):
                 output_path = output_path.rsplit('.', 1)[0] + '.png'
                 print(f"Changed output format to PNG for transparency support: {output_path}")
@@ -1267,7 +1458,7 @@ def main():
         if args.show_reference:
             reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
             
-            if args.format == "jpg":
+            if format_to_use == "jpg":
                 # Convert reference wheel to RGB with black background
                 rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
                 alpha = reference_wheel[:, :, 3] / 255.0
@@ -1276,7 +1467,7 @@ def main():
                     rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background
                 
                 reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
-                reference_path = output_path.replace('.jpg', '_reference.jpg')
+                reference_path = output_path.replace('.jpg', '_reference.jpg').replace('.jpeg', '_reference.jpg')
                 cv2.imwrite(reference_path, reference_wheel_bgr)
             else:
                 reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
@@ -1302,6 +1493,9 @@ def main():
             print("Generating circular color spectrum...")
             circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
             create_circular_color_spectrum(color_percentages, circular_path)
+            
+        total_time = time.time() - total_start
+        print(f"\nTotal processing completed in {format_time(total_time)}")
             
     except Exception as e:
         print(f"Error: {e}")
