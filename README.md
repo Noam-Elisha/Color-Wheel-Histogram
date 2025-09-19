@@ -10,6 +10,50 @@ The Color Wheel tool analyzes images and creates beautiful color wheel visualiza
 - **Multiple output formats** including histograms, spectrums, and circular visualizations
 - **High-performance processing** with GPU acceleration and parallel computing support
 
+## 🖼️ Visual Examples
+
+See how the tool transforms images into stunning color wheel visualizations:
+
+### Van Gogh's Starry Night
+| Original | Color Wheel |
+|----------|-------------|
+| ![Starry Night](examples/starry_night.jpg) | ![Starry Night Color Wheel](examples/starry_night_color_wheel.jpg) |
+
+*The swirling blues and yellows of the night sky are beautifully represented in the color wheel, with the dominant blue tones showing high opacity.*
+
+### Windows Bliss Wallpaper
+| Original | Color Wheel |
+|----------|-------------|
+| ![Bliss](examples/bliss.png) | ![Bliss Color Wheel](examples/bliss_color_wheel.jpg) |
+
+*The natural greens and blues of this landscape create a harmonious color wheel showing the peaceful color palette.*
+
+### Hubble's Pillars of Creation
+| Original | Color Wheel |
+|----------|-------------|
+| ![Pillars](examples/pillars_of_creation.jpg) | ![Pillars Color Wheel](examples/pillars_of_creation_color_wheel.jpg) |
+
+*The cosmic colors - from deep oranges to bright blues - create a dramatic color wheel reflecting the majesty of space.*
+
+## 🚀 Quick Start
+
+1. **Install dependencies:**
+   ```bash
+   pip install -e .
+   ```
+
+2. **Process a single image:**
+   ```bash
+   python color_wheel.py my_image.jpg my_colorwheel.png
+   ```
+
+3. **Process a folder of images:**
+   ```bash
+   python color_wheel.py /path/to/images --format jpg
+   ```
+
+4. **View your results** - color wheels are saved with `_color_wheel` appended to the original filename!
+
 ## ✨ Features
 
 ### Core Functionality
@@ -28,7 +72,8 @@ The Color Wheel tool analyzes images and creates beautiful color wheel visualiza
 ### Advanced Features
 - 🎯 **Nearest Neighbor Matching** - Intelligent color mapping with KDTree optimization
 - 📈 **Color Space Conversions** - RGB, HSV, and other color space support  
-- 🎪 **Batch Processing** - Process multiple images efficiently
+- 📁 **Folder Processing** - Process entire directories of images automatically
+- 🎪 **Batch Operations** - Efficient multi-image processing with progress tracking
 - 📋 **Command Line Interface** - Full CLI support with comprehensive options
 - 🧪 **Comprehensive Testing** - 600+ tests ensuring reliability
 
@@ -59,78 +104,80 @@ pip install numba scikit-learn  # For additional optimizations
 ### Basic Usage
 
 ```bash
-# Generate color wheel from an image
-python color_wheel.py input_image.jpg
+# Single image processing
+python color_wheel.py input_image.jpg output_wheel.png
 
-# With custom output name
-python color_wheel.py input_image.jpg --output my_color_wheel.png
+# With different output formats
+python color_wheel.py input_image.jpg output_wheel.jpg --format jpg
+python color_wheel.py input_image.jpg output_wheel.png --format png
 
-# High-performance mode with GPU acceleration
-python color_wheel.py input_image.jpg --use-gpu --use-numba --use-kdtree --parallel
+# Process entire folder of images
+python color_wheel.py /path/to/image/folder --format jpg
+python color_wheel.py /path/to/image/folder --format png
 
-# Batch processing
-python color_wheel.py *.jpg --parallel
+# Add extra visualizations
+python color_wheel.py input_image.jpg output_wheel.png --show-reference --histogram --color-spectrum
+
+# High-performance mode
+python color_wheel.py input_image.jpg output_wheel.png --gpu --parallel --force-kdtree
 ```
 
-### Python API
+### Folder Processing Examples
 
-```python
-import color_wheel
+```bash
+# Process all images in a folder, save as JPG color wheels
+python color_wheel.py "C:\Users\Photos\Vacation" --format jpg
 
-# Generate color wheel with default settings
-color_wheel.create_color_wheel('input_image.jpg', 'output_wheel.png')
+# Process with custom settings
+python color_wheel.py "./my_images" --format png --size 600 --quantize 4 --show-reference
 
-# Advanced usage with custom parameters
-result = color_wheel.create_color_wheel(
-    input_path='image.jpg',
-    output_path='wheel.png',
-    quantization_factor=32,
-    sample_factor=4,
-    use_gpu=True,
-    use_numba=True,
-    parallel=True
-)
-
-# Create additional visualizations
-color_wheel.create_opacity_histogram('image.jpg', 'histogram.png')
-color_wheel.create_color_spectrum_histogram('image.jpg', 'spectrum.png')
+# High-performance batch processing
+python color_wheel.py "./large_image_set" --format jpg --gpu --parallel --sample-factor 2
 ```
 
 ## 📋 Command Line Options
 
 ```bash
-python color_wheel.py INPUT [OPTIONS]
+python color_wheel.py INPUT [OUTPUT] [OPTIONS]
 
 Required Arguments:
-  INPUT                 Input image file path or glob pattern
+  INPUT                 Input image file path OR folder path containing images
 
-Output Options:
-  -o, --output OUTPUT   Output file path (default: auto-generated)
-  --output-dir DIR      Output directory for batch processing
+Optional Arguments:
+  OUTPUT                Output file path (required for single images, ignored for folders)
+
+Format Options:
+  --format {png,jpg}    Output format: png (supports transparency) or jpg (black background)
+                        Required when processing folders, default: png
 
 Processing Options:
-  -q, --quantization N  Color quantization factor (default: 16)
-  -s, --sample N        Pixel sampling factor (default: 1)
-  --min-frequency N     Minimum color frequency threshold
+  --size SIZE           Size of the color wheel (default: 800)
+  --sample-factor N     Factor to downsample input for faster processing (default: 1)
+  --quantize N          Color quantization level: 1=precise, higher=more grouping (default: 2)
+  --color-space SPACE   Color space: sRGB, Adobe RGB, ProPhoto RGB (default: sRGB)
 
 Performance Options:
-  --use-gpu            Enable GPU acceleration (requires CuPy)
-  --use-numba          Enable JIT compilation (requires Numba)  
-  --use-kdtree         Use KDTree for nearest neighbor (requires scikit-learn)
-  --parallel           Enable parallel processing
-  --no-mmap            Disable memory mapping
+  --gpu                 Force GPU acceleration (requires CuPy)
+  --no-gpu              Disable GPU acceleration
+  --parallel            Force parallel processing
+  --no-parallel         Disable parallel processing  
+  --force-kdtree        Force KDTree for nearest neighbor (requires scikit-learn)
+  --no-kdtree           Disable KDTree, use vectorized fallback
 
 Visualization Options:
-  --create-histogram   Generate opacity histogram
-  --create-spectrum    Generate color spectrum
-  --create-circular    Generate circular spectrum
-  --wheel-size SIZE    Color wheel output size (default: 1000)
-
-Advanced Options:
-  --color-space SPACE  Color space for processing (rgb, hsv)
-  --template-size SIZE Template resolution (default: 1000)
-  --cache-dir DIR      Template cache directory
+  --show-reference      Also save a reference color wheel for comparison
+  --histogram           Generate opacity histogram
+  --color-spectrum      Generate color spectrum histogram
+  --circular-spectrum   Generate circular color spectrum
 ```
+
+### Folder Processing Notes
+
+When processing folders:
+- **Format is required** (`--format jpg` or `--format png`)
+- **Output path is ignored** - wheels are saved next to original images
+- **Automatic naming** - adds `_color_wheel` to original filename
+- **Smart detection** - finds all supported image formats (JPG, JPEG, PNG, BMP, TIFF, TIF, WEBP, GIF)
 
 ## 🎨 Visualization Types
 
@@ -329,4 +376,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Made with ❤️ and lots of ☕ by a passionate developer who loves color theory and data visualization**
+**Made by Noam Elisha with much help from AI (Claude Sonnet 4)**
