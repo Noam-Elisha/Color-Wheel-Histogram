@@ -26,19 +26,19 @@ from pathlib import Path
 
 def check_dependencies():
     """Check if required test dependencies are available."""
-    required_packages = [
-        'pytest',
-        'numpy',
-        'opencv-python',
-    ]
+    required_packages = {
+        'pytest': 'pytest',
+        'numpy': 'numpy', 
+        'opencv-python': 'cv2',
+    }
     
     missing_packages = []
     
-    for package in required_packages:
+    for package_name, import_name in required_packages.items():
         try:
-            __import__(package.replace('-', '_'))
+            __import__(import_name)
         except ImportError:
-            missing_packages.append(package)
+            missing_packages.append(package_name)
     
     if missing_packages:
         print("❌ Missing required packages:")
@@ -54,32 +54,26 @@ def check_dependencies():
 
 def check_optional_dependencies():
     """Check for optional dependencies and show status."""
-    optional_packages = {
-        'pytest-cov': 'Coverage reporting',
-        'pytest-xdist': 'Parallel test execution',
-        'pytest-benchmark': 'Performance benchmarking',
-        'psutil': 'Memory usage monitoring',
-        'scikit-learn': 'KDTree optimization tests',
-        'numba': 'JIT compilation tests',
-        'cupy': 'GPU acceleration tests',
-        'colour-science': 'Color space conversion tests',
-    }
-    
     print("\n📋 Optional dependencies status:")
-    for package, description in optional_packages.items():
+    
+    # Check each dependency with custom logic
+    dependencies = [
+        ('pytest-cov', 'Coverage reporting', lambda: __import__('pytest_cov')),
+        ('pytest-xdist', 'Parallel test execution', lambda: __import__('xdist')),
+        ('pytest-benchmark', 'Performance benchmarking', lambda: __import__('pytest_benchmark')),
+        ('psutil', 'Memory usage monitoring', lambda: __import__('psutil')),
+        ('scikit-learn', 'KDTree optimization tests', lambda: __import__('sklearn')),
+        ('numba', 'JIT compilation tests', lambda: __import__('numba')),
+        ('cupy', 'GPU acceleration tests', lambda: __import__('cupy')),
+        ('colour-science', 'Color space conversion tests', lambda: __import__('colour')),
+    ]
+    
+    for package_name, description, import_func in dependencies:
         try:
-            pkg_name = package.replace('-', '_')
-            if package == 'opencv-python':
-                pkg_name = 'cv2'
-            elif package == 'scikit-learn':
-                pkg_name = 'sklearn'
-            elif package == 'colour-science':
-                pkg_name = 'colour'
-            
-            __import__(pkg_name)
-            print(f"   ✅ {package:<18} - {description}")
+            import_func()
+            print(f"   ✅ {package_name:<18} - {description}")
         except ImportError:
-            print(f"   ❌ {package:<18} - {description}")
+            print(f"   ❌ {package_name:<18} - {description}")
 
 
 def run_tests(args):
@@ -112,8 +106,12 @@ def run_tests(args):
         cmd.append('-q')
     
     # Parallel execution
-    if args.parallel and 'pytest-xdist' in sys.modules:
-        cmd.extend(['-n', str(args.parallel)])
+    if args.parallel:
+        try:
+            import xdist
+            cmd.extend(['-n', str(args.parallel)])
+        except ImportError:
+            print("⚠️  pytest-xdist not available, running tests sequentially")
     
     # Stop on first failure
     if args.fail_fast:

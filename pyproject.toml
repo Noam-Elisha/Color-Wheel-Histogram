@@ -1,3 +1,40 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "color-wheel"
+version = "1.0.0"
+description = "A comprehensive color wheel visualization tool for image analysis"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "matplotlib",
+    "pillow",
+]
+optional-dependencies.gpu = [
+    "cupy",
+]
+optional-dependencies.acceleration = [
+    "numba",
+    "scikit-learn",
+]
+optional-dependencies.dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "pytest-xdist",
+    "pytest-benchmark",
+    "psutil",
+]
+
+[project.scripts]
+color-wheel = "color_wheel:main"
+
+[tool.setuptools]
+py-modules = ["color_wheel"]
+
 [tool.pytest.ini_options]
 minversion = "6.0"
 testpaths = ["tests"]
