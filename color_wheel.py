@@ -17,6 +17,7 @@ import math
 import matplotlib.pyplot as plt
 import pickle
 import os
+import glob
 import time
 import mmap
 import multiprocessing as mp
@@ -1733,13 +1734,206 @@ def create_circular_color_spectrum(color_percentages, output_path, size=800):
     print(f"Circular color spectrum saved to: {output_path}")
 
 
+def get_supported_image_files(folder_path):
+    """
+    Get all supported image files from a folder.
+    
+    Args:
+        folder_path (str): Path to the folder containing images
+        
+    Returns:
+        list: List of paths to supported image files
+    """
+    supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.gif']
+    image_files = []
+    
+    for ext in supported_extensions:
+        # Case insensitive search
+        pattern = os.path.join(folder_path, f"*{ext}")
+        image_files.extend(glob.glob(pattern))
+        pattern = os.path.join(folder_path, f"*{ext.upper()}")
+        image_files.extend(glob.glob(pattern))
+    
+    # Remove duplicates and sort
+    image_files = sorted(list(set(image_files)))
+    
+    return image_files
+
+
+def generate_output_filename(input_path, output_format):
+    """
+    Generate output filename by appending '_color_wheel' to the original filename.
+    
+    Args:
+        input_path (str): Path to the input image
+        output_format (str): Output format ('jpg' or 'png')
+        
+    Returns:
+        str: Generated output filename
+    """
+    # Get directory and base filename without extension
+    directory = os.path.dirname(input_path)
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    
+    # Append '_color_wheel' and the requested extension
+    output_filename = f"{base_name}_color_wheel.{output_format}"
+    output_path = os.path.join(directory, output_filename)
+    
+    return output_path
+
+
+def process_single_image(input_path, output_format, args):
+    """
+    Process a single image to generate a color wheel.
+    
+    Args:
+        input_path (str): Path to the input image
+        output_format (str): Output format ('jpg' or 'png')
+        args: Parsed arguments object with processing parameters
+        
+    Returns:
+        tuple: (success, input_path, output_path, error_message)
+    """
+    try:
+        # Generate output filename
+        output_path = generate_output_filename(input_path, output_format)
+        
+        print(f"\nProcessing: {os.path.basename(input_path)}")
+        print(f"Output: {os.path.basename(output_path)}")
+        
+        # Load and analyze image
+        color_percentages = load_and_analyze_image(
+            input_path, args.sample_factor, args.quantize, 
+            args.use_parallel, args.color_space
+        )
+        print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
+        
+        # Generate color wheel
+        wheel, normalized_percentages, opacity_values = create_color_wheel(
+            color_percentages, args.size, quantize_level=args.quantize, 
+            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel
+        )
+        
+        # Save the wheel in the specified format
+        if output_format == "jpg":
+            # Convert RGBA to RGB by blending with black background
+            rgb_wheel = np.zeros((wheel.shape[0], wheel.shape[1], 3), dtype=np.uint8)
+            alpha = wheel[:, :, 3] / 255.0
+            
+            for i in range(3):
+                rgb_wheel[:, :, i] = (wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)
+            
+            wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]
+            success = cv2.imwrite(output_path, wheel_bgr)
+        else:  # PNG format
+            wheel = wheel.astype(np.uint8)
+            wheel_bgra = wheel[:, :, [2, 1, 0, 3]]
+            success = cv2.imwrite(output_path, wheel_bgra)
+        
+        if not success:
+            return False, input_path, output_path, "Failed to save image"
+        
+        # Generate additional outputs if requested
+        if args.show_reference:
+            reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
+            
+            if output_format == "jpg":
+                rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
+                alpha = reference_wheel[:, :, 3] / 255.0
+                for i in range(3):
+                    rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)
+                reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
+                reference_path = output_path.replace(f'.{output_format}', f'_reference.{output_format}')
+                cv2.imwrite(reference_path, reference_wheel_bgr)
+            else:
+                reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
+                reference_path = output_path.replace(f'.{output_format}', f'_reference.{output_format}')
+                cv2.imwrite(reference_path, reference_wheel_bgra)
+            
+            print(f"Reference wheel saved to: {os.path.basename(reference_path)}")
+        
+        if args.histogram:
+            histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
+            create_opacity_histogram(opacity_values, histogram_path)
+        
+        if args.color_spectrum:
+            spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
+            create_color_spectrum_histogram(color_percentages, spectrum_path)
+        
+        if args.circular_spectrum:
+            circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
+            create_circular_color_spectrum(color_percentages, circular_path)
+        
+        print(f"✓ Color wheel saved to: {os.path.basename(output_path)}")
+        
+        return True, input_path, output_path, None
+        
+    except Exception as e:
+        return False, input_path, "", str(e)
+
+
+def process_folder(folder_path, output_format, args):
+    """
+    Process all images in a folder to generate color wheels.
+    
+    Args:
+        folder_path (str): Path to the folder containing images
+        output_format (str): Output format ('jpg' or 'png')
+        args: Parsed arguments object with processing parameters
+        
+    Returns:
+        tuple: (successful_count, failed_count, total_files)
+    """
+    # Get all supported image files
+    image_files = get_supported_image_files(folder_path)
+    
+    if not image_files:
+        print(f"No supported image files found in: {folder_path}")
+        print("Supported formats: JPG, JPEG, PNG, BMP, TIFF, TIF, WEBP, GIF")
+        return 0, 0, 0
+    
+    total_files = len(image_files)
+    successful_count = 0
+    failed_count = 0
+    
+    print(f"Found {total_files} image files to process in: {folder_path}")
+    print(f"Output format: {output_format.upper()}")
+    print("=" * 60)
+    
+    start_time = time.time()
+    
+    for i, image_path in enumerate(image_files, 1):
+        print(f"[{i}/{total_files}]", end=" ")
+        
+        success, input_path, output_path, error_msg = process_single_image(
+            image_path, output_format, args
+        )
+        
+        if success:
+            successful_count += 1
+        else:
+            failed_count += 1
+            print(f"✗ Failed to process {os.path.basename(input_path)}: {error_msg}")
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    print("=" * 60)
+    print(f"Batch processing completed in {format_time(total_time)}")
+    print(f"Successfully processed: {successful_count}/{total_files} images")
+    if failed_count > 0:
+        print(f"Failed: {failed_count} images")
+    
+    return successful_count, failed_count, total_files
+
+
 def main():
     """Main function to run the color wheel generator."""
     parser = argparse.ArgumentParser(
-        description="Generate a color wheel where opacity represents color frequency in an image"
+        description="Generate a color wheel where opacity represents color frequency in an image or folder of images"
     )
-    parser.add_argument("input_image", help="Path to the input image")
-    parser.add_argument("output_wheel", help="Path for the output color wheel image")
+    parser.add_argument("input", help="Path to the input image or folder containing images")
+    parser.add_argument("output", nargs='?', help="Path for the output color wheel image (not used when processing folders)")
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
     parser.add_argument("--sample-factor", type=int, default=1, 
                        help="Factor to downsample input image for faster processing (default: 1)")
@@ -1748,7 +1942,7 @@ def main():
     parser.add_argument("--show-reference", action="store_true", 
                        help="Also save a reference color wheel for comparison")
     parser.add_argument("--format", choices=["png", "jpg"], default="png",
-                       help="Output format: png (supports transparency) or jpg (black background, default: png)")
+                       help="Output format: png (supports transparency) or jpg (black background). Required when processing folders, default: png)")
     parser.add_argument("--histogram", action="store_true",
                        help="Also generate a histogram showing the distribution of opacity values")
     parser.add_argument("--color-spectrum", action="store_true",
@@ -1821,111 +2015,149 @@ def main():
     if optimizations:
         print(f"Available optimizations: {', '.join(optimizations)}")
     
-    try:
-        total_start = time.time()
+    # Add processed arguments to args object for easy passing to functions
+    args.force_kdtree = force_kdtree
+    args.use_parallel = use_parallel
+    
+    # Determine if input is a file or folder
+    input_path = args.input
+    is_folder = os.path.isdir(input_path)
+    
+    if is_folder:
+        # Folder processing mode
+        if args.output is not None:
+            print("Warning: Output parameter is ignored when processing folders.")
+            print("Color wheels will be saved in the same folder as input images with '_color_wheel' suffix.")
         
-        print(f"Loading and analyzing image: {args.input_image}")
-        color_percentages = load_and_analyze_image(args.input_image, args.sample_factor, args.quantize, use_parallel, args.color_space)
-        print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
-        
-        print("Generating color wheel...")
-        wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree, use_parallel=use_parallel)
-        
-        # Auto-detect format from file extension if not explicitly specified
-        output_path = args.output_wheel
-        if args.format == "png" and (output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg')):
-            print("Auto-detected JPG format from file extension")
-            format_to_use = "jpg"
-        elif args.format == "jpg" and output_path.lower().endswith('.png'):
-            print("Auto-detected PNG format from file extension")
-            format_to_use = "png"
-        else:
-            format_to_use = args.format
-        
-        # Handle output format
-        if format_to_use == "jpg":
-            # JPG doesn't support transparency, so blend with black background
-            if not output_path.lower().endswith('.jpg') and not output_path.lower().endswith('.jpeg'):
-                output_path = output_path.rsplit('.', 1)[0] + '.jpg'
-                print(f"Changed output format to JPG: {output_path}")
-            
-            # Convert RGBA to RGB by blending with black background
-            rgb_wheel = np.zeros((wheel.shape[0], wheel.shape[1], 3), dtype=np.uint8)
-            alpha = wheel[:, :, 3] / 255.0  # Normalize alpha to 0-1
-            
-            for i in range(3):  # RGB channels
-                rgb_wheel[:, :, i] = (wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background (0)
-            
-            # Convert RGB to BGR for OpenCV
-            wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]  # RGB -> BGR
-            success = cv2.imwrite(output_path, wheel_bgr)
-            
-        else:  # PNG format
-            # Ensure output filename has .png extension for RGBA support
-            if not output_path.lower().endswith('.png'):
-                output_path = output_path.rsplit('.', 1)[0] + '.png'
-                print(f"Changed output format to PNG for transparency support: {output_path}")
-            
-            # Ensure wheel array is proper uint8 format
-            wheel = wheel.astype(np.uint8)
-            
-            # Save directly as RGBA PNG (no conversion needed)
-            # OpenCV expects BGR or BGRA, so convert RGBA to BGRA
-            wheel_bgra = wheel[:, :, [2, 1, 0, 3]]  # Swap R and B channels: RGBA -> BGRA
-            success = cv2.imwrite(output_path, wheel_bgra)
-        
-        if not success:
-            print(f"Error: Failed to save image to {output_path}")
+        print(f"Processing folder: {input_path}")
+        try:
+            successful, failed, total = process_folder(input_path, args.format, args)
+            if total == 0:
+                return 1
+            elif failed > 0:
+                return 2  # Partial success
+            else:
+                return 0  # Complete success
+        except Exception as e:
+            print(f"Error processing folder: {e}")
+            return 1
+    
+    else:
+        # Single file processing mode
+        if not os.path.isfile(input_path):
+            print(f"Error: Input file does not exist: {input_path}")
             return 1
         
-        print(f"Color wheel saved to: {output_path}")
+        if args.output is None:
+            print("Error: Output path is required when processing a single image.")
+            print("Usage: python color_wheel.py input_image.jpg output_wheel.png")
+            return 1
         
-        # Optionally save reference wheel
-        if args.show_reference:
-            reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
+        try:
+            total_start = time.time()
             
-            if format_to_use == "jpg":
-                # Convert reference wheel to RGB with black background
-                rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
-                alpha = reference_wheel[:, :, 3] / 255.0
-                
-                for i in range(3):
-                    rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background
-                
-                reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
-                reference_path = output_path.replace('.jpg', '_reference.jpg').replace('.jpeg', '_reference.jpg')
-                cv2.imwrite(reference_path, reference_wheel_bgr)
+            print(f"Loading and analyzing image: {input_path}")
+            color_percentages = load_and_analyze_image(input_path, args.sample_factor, args.quantize, use_parallel, args.color_space)
+            print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
+            
+            print("Generating color wheel...")
+            wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree, use_parallel=use_parallel)
+            
+            # Auto-detect format from file extension if not explicitly specified
+            output_path = args.output
+            if args.format == "png" and (output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg')):
+                print("Auto-detected JPG format from file extension")
+                format_to_use = "jpg"
+            elif args.format == "jpg" and output_path.lower().endswith('.png'):
+                print("Auto-detected PNG format from file extension")
+                format_to_use = "png"
             else:
-                reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
-                reference_path = output_path.replace('.png', '_reference.png')
-                cv2.imwrite(reference_path, reference_wheel_bgra)
+                format_to_use = args.format
+            
+            # Handle output format
+            if format_to_use == "jpg":
+                # JPG doesn't support transparency, so blend with black background
+                if not output_path.lower().endswith('.jpg') and not output_path.lower().endswith('.jpeg'):
+                    output_path = output_path.rsplit('.', 1)[0] + '.jpg'
+                    print(f"Changed output format to JPG: {output_path}")
                 
-            print(f"Reference wheel saved to: {reference_path}")
-        
-        # Generate histogram if requested
-        if args.histogram:
-            print("Generating opacity histogram...")
-            histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
-            create_opacity_histogram(opacity_values, histogram_path)
+                # Convert RGBA to RGB by blending with black background
+                rgb_wheel = np.zeros((wheel.shape[0], wheel.shape[1], 3), dtype=np.uint8)
+                alpha = wheel[:, :, 3] / 255.0  # Normalize alpha to 0-1
+                
+                for i in range(3):  # RGB channels
+                    rgb_wheel[:, :, i] = (wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background (0)
+                
+                # Convert RGB to BGR for OpenCV
+                wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]  # RGB -> BGR
+                success = cv2.imwrite(output_path, wheel_bgr)
+                
+            else:  # PNG format
+                # Ensure output filename has .png extension for RGBA support
+                if not output_path.lower().endswith('.png'):
+                    output_path = output_path.rsplit('.', 1)[0] + '.png'
+                    print(f"Changed output format to PNG for transparency support: {output_path}")
+                
+                # Ensure wheel array is proper uint8 format
+                wheel = wheel.astype(np.uint8)
+                
+                # Save directly as RGBA PNG (no conversion needed)
+                # OpenCV expects BGR or BGRA, so convert RGBA to BGRA
+                wheel_bgra = wheel[:, :, [2, 1, 0, 3]]  # Swap R and B channels: RGBA -> BGRA
+                success = cv2.imwrite(output_path, wheel_bgra)
             
-        # Generate color spectrum histogram if requested
-        if args.color_spectrum:
-            print("Generating color spectrum histogram...")
-            spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
-            create_color_spectrum_histogram(color_percentages, spectrum_path)
+            if not success:
+                print(f"Error: Failed to save image to {output_path}")
+                return 1
             
-        # Generate circular color spectrum if requested
-        if args.circular_spectrum:
-            print("Generating circular color spectrum...")
-            circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
-            create_circular_color_spectrum(color_percentages, circular_path)
+            print(f"Color wheel saved to: {output_path}")
             
-        total_time = time.time() - total_start
-        print(f"\nTotal processing completed in {format_time(total_time)}")
+            # Optionally save reference wheel
+            if args.show_reference:
+                reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
+                
+                if format_to_use == "jpg":
+                    # Convert reference wheel to RGB with black background
+                    rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
+                    alpha = reference_wheel[:, :, 3] / 255.0
+                    
+                    for i in range(3):
+                        rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background
+                    
+                    reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
+                    reference_path = output_path.replace('.jpg', '_reference.jpg').replace('.jpeg', '_reference.jpg')
+                    cv2.imwrite(reference_path, reference_wheel_bgr)
+                else:
+                    reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
+                    reference_path = output_path.replace('.png', '_reference.png')
+                    cv2.imwrite(reference_path, reference_wheel_bgra)
+                    
+                print(f"Reference wheel saved to: {reference_path}")
             
-    except Exception as e:
-        print(f"Error: {e}")
-        return 1
+            # Generate histogram if requested
+            if args.histogram:
+                print("Generating opacity histogram...")
+                histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
+                create_opacity_histogram(opacity_values, histogram_path)
+                
+            # Generate color spectrum histogram if requested
+            if args.color_spectrum:
+                print("Generating color spectrum histogram...")
+                spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
+                create_color_spectrum_histogram(color_percentages, spectrum_path)
+                
+            # Generate circular color spectrum if requested
+            if args.circular_spectrum:
+                print("Generating circular color spectrum...")
+                circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
+                create_circular_color_spectrum(color_percentages, circular_path)
+                
+            total_time = time.time() - total_start
+            print(f"\nTotal processing completed in {format_time(total_time)}")
+                
+        except Exception as e:
+            print(f"Error: {e}")
+            return 1
     
     return 0
 
