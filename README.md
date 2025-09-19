@@ -57,25 +57,25 @@ See how the tool transforms images into stunning color wheel visualizations:
 ## ✨ Features
 
 ### Core Functionality
-- 🎨 **Color Wheel Generation** - Maps image colors to traditional color wheel positions
-- 📊 **Multiple Visualizations** - Histograms, spectrums, and circular color plots  
-- 🖼️ **Flexible Image Support** - Works with all common image formats
-- 🎛️ **Customizable Parameters** - Adjustable quantization, sampling, and output options
+- **Color Wheel Generation** - Maps image colors to traditional color wheel positions
+- **Multiple Visualizations** - Histograms, spectrums, and circular color plots  
+- **Flexible Image Support** - Works with all common image formats
+- **Customizable Parameters** - Adjustable quantization, sampling, and output options
 
 ### Performance Optimizations
-- ⚡ **GPU Acceleration** - CUDA support via CuPy for massive speedups
-- 🚀 **JIT Compilation** - Numba acceleration for CPU-intensive operations
-- 🔄 **Parallel Processing** - Multi-core processing for large images
-- 💾 **Template Caching** - Smart caching system for wheel templates
-- 🗄️ **Memory Mapping** - Efficient memory usage for large datasets
+- **GPU Acceleration** - CUDA support via CuPy for massive speedups
+- **JIT Compilation** - Numba acceleration for CPU-intensive operations
+- **Parallel Processing** - Multi-core processing for large images
+- **Template Caching** - Smart caching system for wheel templates
+- **Memory Mapping** - Efficient memory usage for large datasets
 
 ### Advanced Features
-- 🎯 **Nearest Neighbor Matching** - Intelligent color mapping with KDTree optimization
-- 📈 **Color Space Conversions** - RGB, HSV, and other color space support  
-- 📁 **Folder Processing** - Process entire directories of images automatically
-- 🎪 **Batch Operations** - Efficient multi-image processing with progress tracking
-- 📋 **Command Line Interface** - Full CLI support with comprehensive options
-- 🧪 **Comprehensive Testing** - 600+ tests ensuring reliability
+- **Nearest Neighbor Matching** - Intelligent color mapping with KDTree optimization
+- **Color Space Conversions** - RGB, HSV, and other color space support  
+- **Folder Processing** - Process entire directories of images automatically
+- **Batch Operations** - Efficient multi-image processing with progress tracking
+- **Command Line Interface** - Full CLI support with comprehensive options
+- **Comprehensive Testing** - 600+ tests ensuring reliability
 
 ## 🚀 Quick Start
 
