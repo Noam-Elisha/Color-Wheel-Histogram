@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import pickle
 import os
 import time
+import mmap
 import multiprocessing as mp
 from functools import partial
 try:
@@ -391,17 +392,102 @@ def get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level):
     return os.path.join(templates_dir, filename)
 
 
+def get_mmap_template_paths(wheel_size, inner_radius_ratio, quantize_level):
+    """Get the paths for the memory-mapped wheel template files."""
+    templates_dir = "wheel_templates"
+    if not os.path.exists(templates_dir):
+        os.makedirs(templates_dir)
+    
+    base_name = f"wheel_mmap_{wheel_size}_{inner_radius_ratio:.3f}_q{quantize_level}"
+    return {
+        'rgb': os.path.join(templates_dir, f"{base_name}_rgb.dat"),
+        'pixels': os.path.join(templates_dir, f"{base_name}_pixels.pkl"),  # Complex dict, keep as pickle
+        'hsv': os.path.join(templates_dir, f"{base_name}_hsv.pkl"),      # HSV cache as pickle
+        'meta': os.path.join(templates_dir, f"{base_name}_meta.pkl")     # Metadata (shape, etc.)
+    }
+
+
+def save_mmap_template(wheel_rgb, color_to_pixels_map, wheel_hsv_cache, wheel_size, inner_radius_ratio, quantize_level):
+    """Save wheel template using memory-mapped files for faster loading."""
+    paths = get_mmap_template_paths(wheel_size, inner_radius_ratio, quantize_level)
+    
+    # Save RGB data as binary file for memory mapping
+    wheel_rgb_flat = wheel_rgb.astype(np.uint8)  # Ensure uint8 for smaller files
+    wheel_rgb_flat.tofile(paths['rgb'])
+    
+    # Save metadata
+    metadata = {
+        'shape': wheel_rgb.shape,
+        'dtype': 'uint8'
+    }
+    with open(paths['meta'], 'wb') as f:
+        pickle.dump(metadata, f)
+    
+    # Save pixel mapping and HSV cache (these are complex dicts, keep as pickle for now)
+    with open(paths['pixels'], 'wb') as f:
+        pickle.dump(color_to_pixels_map, f)
+    
+    with open(paths['hsv'], 'wb') as f:
+        pickle.dump(wheel_hsv_cache, f)
+    
+    rgb_size_kb = os.path.getsize(paths['rgb']) // 1024
+    print(f"Memory-mapped template saved (RGB: {rgb_size_kb}KB, instant loading)")
+
+
+def load_mmap_template(wheel_size, inner_radius_ratio, quantize_level):
+    """Load wheel template using memory-mapped files for instant access."""
+    paths = get_mmap_template_paths(wheel_size, inner_radius_ratio, quantize_level)
+    
+    # Check if all required files exist
+    required_files = ['rgb', 'pixels', 'hsv', 'meta']
+    if not all(os.path.exists(paths[key]) for key in required_files):
+        return None
+    
+    try:
+        # Load metadata first
+        with open(paths['meta'], 'rb') as f:
+            metadata = pickle.load(f)
+        
+        # Load RGB data using memory mapping (true zero-copy access)
+        with open(paths['rgb'], 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                wheel_rgb = np.frombuffer(mm, dtype=np.uint8).copy()
+                wheel_rgb = wheel_rgb.reshape(metadata['shape'])
+        
+        # Load pixel mapping and HSV cache (still using pickle, but these are smaller)
+        with open(paths['pixels'], 'rb') as f:
+            color_to_pixels_map = pickle.load(f)
+        
+        with open(paths['hsv'], 'rb') as f:
+            wheel_hsv_cache = pickle.load(f)
+        
+        rgb_size_kb = os.path.getsize(paths['rgb']) // 1024
+        print(f"Memory-mapped template loaded (RGB: {rgb_size_kb}KB, zero-copy)")
+        return wheel_rgb, color_to_pixels_map, wheel_hsv_cache
+    
+    except Exception as e:
+        print(f"Failed to load memory-mapped template: {e}")
+        return None
+
+
 def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quantize_level=8):
     """
     Load existing wheel template or create a new one if it doesn't exist.
+    Prefers memory-mapped format for fastest loading, falls back to pickle format.
     
     Returns:
         tuple: (wheel_rgb, color_to_pixels_map, wheel_hsv_cache)
     """
+    # Try to load memory-mapped template first (fastest)
+    mmap_result = load_mmap_template(wheel_size, inner_radius_ratio, quantize_level)
+    if mmap_result is not None:
+        return mmap_result
+    
+    # Fall back to pickle template
     template_path = get_wheel_template_path(wheel_size, inner_radius_ratio, quantize_level)
     
     if os.path.exists(template_path):
-        print(f"Loading precomputed wheel template: {template_path}")
+        print(f"Loading pickle template (will upgrade to memory-mapped): {template_path}")
         with open(template_path, 'rb') as f:
             template_data = pickle.load(f)
         
@@ -417,24 +503,31 @@ def load_or_create_wheel_template(wheel_size=800, inner_radius_ratio=0.1, quanti
             for i, color in enumerate(wheel_colors):
                 wheel_hsv_cache[color] = wheel_hsv[i]
             
-            # Save updated template
+            # Update template_data for saving
             template_data = (wheel_rgb, color_to_pixels_map, wheel_hsv_cache)
-            with open(template_path, 'wb') as f:
-                pickle.dump(template_data, f)
-            print(f"Updated template saved with HSV cache")
         else:
             wheel_rgb, color_to_pixels_map, wheel_hsv_cache = template_data
-            
+        
+        # Save memory-mapped version for faster future loading
+        print("Saving memory-mapped version for faster future loading...")
+        save_mmap_template(wheel_rgb, color_to_pixels_map, wheel_hsv_cache, 
+                          wheel_size, inner_radius_ratio, quantize_level)
+        
         return wheel_rgb, color_to_pixels_map, wheel_hsv_cache
     else:
-        print(f"Creating new wheel template: {template_path}")
+        print(f"Creating new wheel template...")
         template_data = create_wheel_template(wheel_size, inner_radius_ratio, quantize_level)
+        wheel_rgb, color_to_pixels_map, wheel_hsv_cache = template_data
         
-        # Save the template for future use
+        # Save both pickle format (for compatibility) and memory-mapped format (for speed)
+        print("Saving template in both pickle and memory-mapped formats...")
         with open(template_path, 'wb') as f:
             pickle.dump(template_data, f)
         
-        print(f"Wheel template saved to: {template_path}")
+        save_mmap_template(wheel_rgb, color_to_pixels_map, wheel_hsv_cache,
+                          wheel_size, inner_radius_ratio, quantize_level)
+        
+        print(f"Templates saved - next run will use instant memory-mapped loading")
         return template_data
 
 
