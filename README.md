@@ -359,11 +359,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgments
 
-- Traditional color theory and color wheel design principles
-- The NumPy and OpenCV communities for excellent documentation
+- Claude Sonnet 4
+- Github Copilot
 - Performance optimization techniques from the scientific Python ecosystem
-- Testing methodologies from the pytest community
 
 ---
 
-**Made by Noam Elisha with much help from AI (Claude Sonnet 4)**
+**Made by Noam Elisha**
