@@ -1,85 +1,75 @@
 # Color Wheel Visualization Tool
 
-A powerful and comprehensive Python tool for creating visual color histograms mapped onto color wheels, providing intuitive color analysis and visualization for digital images.
+A Python tool for creating color wheel visualizations from images. Maps colors to their positions on a traditional color wheel where opacity represents how frequently each color appears.
 
-## 🎨 Overview
+## Overview
 
-The Color Wheel tool analyzes images and creates beautiful color wheel visualizations where:
-- **Colors are mapped to their natural position** on a traditional color wheel
-- **Opacity represents frequency** - more common colors appear more opaque
-- **Multiple output formats** including histograms, spectrums, and circular visualizations
-- **High-performance processing** with GPU acceleration and parallel computing support
+This tool analyzes images and creates color wheel visualizations where:
+- Colors are mapped to their natural position on a traditional color wheel
+- Opacity represents frequency - more common colors appear more opaque
+- Supports multiple output formats including histograms and spectrums
+- Includes performance optimizations for large images
 
-## 🖼️ Visual Examples
-
-See how the tool transforms images into stunning color wheel visualizations:
+## Examples
 
 ### Van Gogh's Starry Night
 | Original | Color Wheel |
 |----------|-------------|
 | ![Starry Night](examples/starry_night.jpg) | ![Starry Night Color Wheel](examples/starry_night_color_wheel.jpg) |
 
-*The swirling blues and yellows of the night sky are beautifully represented in the color wheel, with the dominant blue tones showing high opacity.*
-
 ### Windows Bliss Wallpaper
 | Original | Color Wheel |
 |----------|-------------|
 | ![Bliss](examples/bliss.png) | ![Bliss Color Wheel](examples/bliss_color_wheel.jpg) |
-
-*The natural greens and blues of this landscape create a harmonious color wheel showing the peaceful color palette.*
 
 ### Hubble's Pillars of Creation
 | Original | Color Wheel |
 |----------|-------------|
 | ![Pillars](examples/pillars_of_creation.jpg) | ![Pillars Color Wheel](examples/pillars_of_creation_color_wheel.jpg) |
 
-*The cosmic colors - from deep oranges to bright blues - create a dramatic color wheel reflecting the majesty of space.*
+## Quick Start
 
-## 🚀 Quick Start
-
-1. **Install dependencies:**
+1. Install dependencies:
    ```bash
    pip install -e .
    ```
 
-2. **Process a single image:**
+2. Process a single image:
    ```bash
    python color_wheel.py my_image.jpg my_colorwheel.png
    ```
 
-3. **Process a folder of images:**
+3. Process a folder of images:
    ```bash
    python color_wheel.py /path/to/images --format jpg
    ```
 
-4. **View your results** - color wheels are saved with `_color_wheel` appended to the original filename!
+4. View your results - color wheels are saved with `_color_wheel` appended to the original filename.
 
-## ✨ Features
+## Features
 
 ### Core Functionality
-- **Color Wheel Generation** - Maps image colors to traditional color wheel positions
-- **Multiple Visualizations** - Histograms, spectrums, and circular color plots  
-- **Flexible Image Support** - Works with all common image formats
-- **Customizable Parameters** - Adjustable quantization, sampling, and output options
+- Color wheel generation - maps image colors to traditional color wheel positions
+- Multiple visualizations - histograms, spectrums, and circular color plots  
+- Flexible image support - works with common image formats (JPG, PNG, BMP, etc.)
+- Customizable parameters - adjustable quantization, sampling, and output options
 
-### Performance Optimizations
-- **GPU Acceleration** - CUDA support via CuPy for massive speedups
-- **JIT Compilation** - Numba acceleration for CPU-intensive operations
-- **Parallel Processing** - Multi-core processing for large images
-- **Template Caching** - Smart caching system for wheel templates
-- **Memory Mapping** - Efficient memory usage for large datasets
+### Performance Options
+- GPU acceleration - CUDA support via CuPy for faster processing
+- JIT compilation - Numba acceleration for CPU-intensive operations
+- Parallel processing - multi-core processing for large images
+- Template caching - caches wheel templates for faster repeated processing
+- Memory mapping - efficient memory usage for large datasets
 
 ### Advanced Features
-- **Nearest Neighbor Matching** - Intelligent color mapping with KDTree optimization
-- **Color Space Conversions** - RGB, HSV, and other color space support  
-- **Folder Processing** - Process entire directories of images automatically
-- **Batch Operations** - Efficient multi-image processing with progress tracking
-- **Command Line Interface** - Full CLI support with comprehensive options
-- **Comprehensive Testing** - 600+ tests ensuring reliability
+- Nearest neighbor matching - intelligent color mapping with KDTree optimization
+- Color space conversions - RGB, HSV, and other color space support  
+- Folder processing - process entire directories of images automatically
+- Batch operations - multi-image processing with progress tracking
+- Command line interface - full CLI support with comprehensive options
+- Comprehensive testing - 600+ tests ensuring reliability
 
-## 🚀 Quick Start
-
-### Installation
+## Installation
 
 ```bash
 # Clone the repository
@@ -93,21 +83,21 @@ python -m venv .venv
 # macOS/Linux  
 source .venv/bin/activate
 
-# Install the package in development mode
+# Install the package
 pip install -e .
 
-# Optional: Install GPU acceleration support
+# Optional: Install performance enhancements
 pip install cupy-cuda12x  # For CUDA 12.x
 pip install numba scikit-learn  # For additional optimizations
 ```
 
-### Basic Usage
+## Usage
 
 ```bash
 # Single image processing
 python color_wheel.py input_image.jpg output_wheel.png
 
-# With different output formats
+# Different output formats
 python color_wheel.py input_image.jpg output_wheel.jpg --format jpg
 python color_wheel.py input_image.jpg output_wheel.png --format png
 
@@ -118,11 +108,11 @@ python color_wheel.py /path/to/image/folder --format png
 # Add extra visualizations
 python color_wheel.py input_image.jpg output_wheel.png --show-reference --histogram --color-spectrum
 
-# High-performance mode
+# Performance mode
 python color_wheel.py input_image.jpg output_wheel.png --gpu --parallel --force-kdtree
 ```
 
-### Folder Processing Examples
+### Folder Processing
 
 ```bash
 # Process all images in a folder, save as JPG color wheels
@@ -131,11 +121,11 @@ python color_wheel.py "C:\Users\Photos\Vacation" --format jpg
 # Process with custom settings
 python color_wheel.py "./my_images" --format png --size 600 --quantize 4 --show-reference
 
-# High-performance batch processing
+# Batch processing with performance options
 python color_wheel.py "./large_image_set" --format jpg --gpu --parallel --sample-factor 2
 ```
 
-## 📋 Command Line Options
+## Command Line Options
 
 ```bash
 python color_wheel.py INPUT [OUTPUT] [OPTIONS]
@@ -174,15 +164,15 @@ Visualization Options:
 ### Folder Processing Notes
 
 When processing folders:
-- **Format is required** (`--format jpg` or `--format png`)
-- **Output path is ignored** - wheels are saved next to original images
-- **Automatic naming** - adds `_color_wheel` to original filename
-- **Smart detection** - finds all supported image formats (JPG, JPEG, PNG, BMP, TIFF, TIF, WEBP, GIF)
+- Format is required (`--format jpg` or `--format png`)
+- Output path is ignored - wheels are saved next to original images
+- Automatic naming - adds `_color_wheel` to original filename
+- Finds all supported image formats (JPG, JPEG, PNG, BMP, TIFF, TIF, WEBP, GIF)
 
-## 🎨 Visualization Types
+## Visualization Types
 
 ### 1. Color Wheel
-The main visualization showing colors mapped to their natural positions on a traditional color wheel with opacity indicating frequency.
+The main visualization showing colors mapped to their positions on a traditional color wheel with opacity indicating frequency.
 
 ### 2. Opacity Histogram  
 A histogram showing color distribution with opacity-weighted bars.
@@ -197,19 +187,19 @@ A circular arrangement showing color progression around the wheel perimeter.
 
 ### Core Components
 
-- **`create_color_wheel()`** - Main color wheel generation function
-- **`load_and_analyze_image()`** - Image loading and color analysis
-- **`find_nearest_wheel_colors()`** - Color mapping to wheel positions
-- **Template System** - Efficient wheel template generation and caching
-- **Visualization Functions** - Multiple output format generators
+- `create_color_wheel()` - Main color wheel generation function
+- `load_and_analyze_image()` - Image loading and color analysis
+- `find_nearest_wheel_colors()` - Color mapping to wheel positions
+- Template System - Efficient wheel template generation and caching
+- Visualization Functions - Multiple output format generators
 
 ### Optimization Systems
 
-- **GPU Processing** - CuPy-based GPU acceleration for color operations
-- **JIT Compilation** - Numba-accelerated hot paths for CPU processing
-- **Parallel Computing** - Multi-process handling for large images
-- **Smart Caching** - Template and computation result caching
-- **Memory Mapping** - Efficient handling of large datasets
+- GPU Processing - CuPy-based GPU acceleration for color operations
+- JIT Compilation - Numba-accelerated hot paths for CPU processing
+- Parallel Computing - Multi-process handling for large images
+- Smart Caching - Template and computation result caching
+- Memory Mapping - Efficient handling of large datasets
 
 ### Performance Characteristics
 
@@ -220,7 +210,7 @@ A circular arrangement showing color progression around the wheel perimeter.
 | 10MP       | ~20s     | ~1.5s    | ~400MB      |
 | 50MP       | ~120s    | ~6s      | ~2GB        |
 
-## 🧪 Testing
+## Testing
 
 The project includes a comprehensive test suite with 600+ tests covering all functionality:
 
@@ -267,25 +257,25 @@ export OPENBLAS_NUM_THREADS=4  # BLAS thread count
 
 ### Template Caching
 Templates are automatically cached in:
-- **Windows**: `%APPDATA%/color_wheel/templates/`
-- **macOS**: `~/Library/Caches/color_wheel/templates/`
-- **Linux**: `~/.cache/color_wheel/templates/`
+- Windows: `%APPDATA%/color_wheel/templates/`
+- macOS: `~/Library/Caches/color_wheel/templates/`
+- Linux: `~/.cache/color_wheel/templates/`
 
-## 📊 Performance Optimization
+## Performance Optimization
 
 ### For Small Images (< 1MP)
 ```bash
-python color_wheel.py image.jpg --quantization 8
+python color_wheel.py image.jpg --quantize 8
 ```
 
 ### For Medium Images (1-10MP)  
 ```bash
-python color_wheel.py image.jpg --use-numba --quantization 16 --sample 2
+python color_wheel.py image.jpg --parallel --quantize 16 --sample-factor 2
 ```
 
 ### For Large Images (> 10MP)
 ```bash
-python color_wheel.py image.jpg --use-gpu --use-numba --use-kdtree --parallel --quantization 32 --sample 4
+python color_wheel.py image.jpg --gpu --parallel --force-kdtree --quantize 32 --sample-factor 4
 ```
 
 ### Batch Processing
@@ -327,12 +317,12 @@ python color_wheel.py image.jpg --use-gpu --use-numba --use-kdtree --parallel
 ### Performance Tips
 
 1. **Use GPU acceleration** for large images when available
-2. **Enable parallel processing** for multi-core systems  
-3. **Increase sampling factor** for very large images to reduce processing time
-4. **Use appropriate quantization** - higher values = faster processing, lower quality
-5. **Keep templates cached** - don't clear cache directory for better performance
+2. Enable parallel processing for multi-core systems  
+3. Increase sampling factor for very large images to reduce processing time
+4. Use appropriate quantization - higher values = faster processing, lower quality
+5. Keep templates cached - don't clear cache directory for better performance
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
@@ -343,31 +333,31 @@ python color_wheel.py image.jpg --use-gpu --use-numba --use-kdtree --parallel
 7. Push to the branch (`git push origin feature/amazing-feature`)
 8. Open a Pull Request
 
-## 📄 Dependencies
+## Dependencies
 
 ### Required
-- **Python 3.8+**
-- **NumPy** - Numerical computing
-- **OpenCV** - Image processing  
-- **Matplotlib** - Visualization and plotting
-- **Pillow** - Additional image format support
+- Python 3.8+
+- NumPy - Numerical computing
+- OpenCV - Image processing  
+- Matplotlib - Visualization and plotting
+- Pillow - Additional image format support
 
 ### Optional (for enhanced performance)
-- **CuPy** - GPU acceleration
-- **Numba** - JIT compilation
-- **scikit-learn** - KDTree nearest neighbor optimization
-- **psutil** - Memory monitoring
+- CuPy - GPU acceleration
+- Numba - JIT compilation
+- scikit-learn - KDTree nearest neighbor optimization
+- psutil - Memory monitoring
 
 ### Development
-- **pytest** - Testing framework
-- **pytest-cov** - Coverage reporting
-- **pytest-xdist** - Parallel test execution
+- pytest - Testing framework
+- pytest-cov - Coverage reporting
+- pytest-xdist - Parallel test execution
 
-## 📜 License
+## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - Traditional color theory and color wheel design principles
 - The NumPy and OpenCV communities for excellent documentation
