@@ -101,6 +101,7 @@ cython_debug/
 # Color Wheel specific files
 wheel_templates/
 output/
+# Image files (ignore everywhere except examples folder)
 *.png
 *.jpg
 *.jpeg
@@ -108,6 +109,15 @@ output/
 *.bmp
 *.tiff
 *.webp
+# But keep image files in examples folder
+!examples/
+!examples/**/*.png
+!examples/**/*.jpg
+!examples/**/*.jpeg
+!examples/**/*.gif
+!examples/**/*.bmp
+!examples/**/*.tiff
+!examples/**/*.webp
 *.pkl
 *.npy
 
@@ -153,3 +163,6 @@ core.*
 # Configuration files
 config.local.ini
 secrets.env
+
+# Helper files
+helper_scripts/
