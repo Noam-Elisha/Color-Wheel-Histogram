@@ -1742,9 +1742,9 @@ def main():
     parser.add_argument("output_wheel", help="Path for the output color wheel image")
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
     parser.add_argument("--sample-factor", type=int, default=1, 
-                       help="Factor to downsample input image for faster processing (default: 4)")
-    parser.add_argument("--quantize", type=int, default=8, 
-                       help="Color quantization level: 1=no quantization (most precise), higher=more grouping (default: 8)")
+                       help="Factor to downsample input image for faster processing (default: 1)")
+    parser.add_argument("--quantize", type=int, default=2, 
+                       help="Color quantization level: 1=no quantization (most precise), higher=more grouping (default: 2)")
     parser.add_argument("--show-reference", action="store_true", 
                        help="Also save a reference color wheel for comparison")
     parser.add_argument("--format", choices=["png", "jpg"], default="png",
