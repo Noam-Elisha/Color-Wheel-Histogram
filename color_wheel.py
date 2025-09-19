@@ -1337,10 +1337,27 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
             else:
                 wheel_color_frequencies[nearest_wheel_color] = percentage
     
-    # Normalize accumulated frequencies so max becomes 1.0 (to prevent overflow)
+    # Normalize accumulated frequencies: most frequent wheel color = 1.0, least frequent = 0.0
+    # This ensures proper opacity mapping regardless of how many input colors map to wheel colors
     max_accumulated_freq = max(wheel_color_frequencies.values()) if wheel_color_frequencies else 1.0
-    for wheel_color in wheel_color_frequencies:
-        wheel_color_frequencies[wheel_color] /= max_accumulated_freq
+    min_accumulated_freq = min(wheel_color_frequencies.values()) if wheel_color_frequencies else 0.0
+    freq_range = max_accumulated_freq - min_accumulated_freq
+    
+    if freq_range > 0:
+        # Normalize to [0, 1] range: (value - min) / (max - min)
+        for wheel_color in wheel_color_frequencies:
+            wheel_color_frequencies[wheel_color] = (wheel_color_frequencies[wheel_color] - min_accumulated_freq) / freq_range
+        print(f"Frequency normalization: {min_accumulated_freq:.6f} → 0.0, {max_accumulated_freq:.6f} → 1.0")
+    else:
+        # All frequencies are the same, set them to 1.0
+        for wheel_color in wheel_color_frequencies:
+            wheel_color_frequencies[wheel_color] = 1.0
+        print(f"All wheel colors have equal frequency: {max_accumulated_freq:.6f}")
+    
+    # Debug: show frequency distribution
+    if wheel_color_frequencies:
+        freq_values = list(wheel_color_frequencies.values())
+        print(f"Final frequency range: {min(freq_values):.6f} to {max(freq_values):.6f} (wheel colors: {len(wheel_color_frequencies)})")
     
     # Now apply frequencies to the wheel using the mapped colors
     opacity_mapping_start = time.time()
@@ -1353,7 +1370,7 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
             # Map normalized frequency to opacity range (128-255)
             # Using linear mapping for even distribution
             
-            curved_frequency = normalized_frequency  # Linear mapping for even spread
+            curved_frequency = normalized_frequency ** 0.25 # curve mapping for even spread
             opacity = int(64 + (255 - 64) * curved_frequency)  # Map to 64-255 range
             opacity_values.append(opacity)  # Collect for histogram
         else:
