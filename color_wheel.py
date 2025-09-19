@@ -45,6 +45,21 @@ except ImportError:
     print("Warning: colour-science not available. Adobe RGB conversion not supported.")
     print("For Adobe RGB support, install colour-science: pip install colour-science")
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+    print(f"GPU acceleration available: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
+except ImportError:
+    CUPY_AVAILABLE = False
+    cp = None
+    print("Warning: CuPy not available. GPU acceleration not supported.")
+    print("For GPU acceleration, install CuPy: pip install cupy-cuda11x or cupy-cuda12x")
+except Exception as e:
+    CUPY_AVAILABLE = False
+    cp = None
+    print(f"Warning: CuPy available but GPU not accessible: {e}")
+    print("Falling back to CPU processing.")
+
 
 def format_time(seconds):
     """Format time in a human-readable way."""
@@ -703,7 +718,7 @@ def rgb_to_hsv_normalized(r, g, b):
 def rgb_to_hsv_vectorized(rgb_array):
     """
     Vectorized RGB to HSV conversion using NumPy operations.
-    Much faster than individual colorsys calls.
+    Automatically uses GPU acceleration with CuPy if available.
     
     Args:
         rgb_array: numpy array of shape (N, 3) with RGB values in range [0, 1]
@@ -711,9 +726,81 @@ def rgb_to_hsv_vectorized(rgb_array):
     Returns:
         numpy array of shape (N, 3) with HSV values
     """
-    if NUMBA_AVAILABLE:
+    if CUPY_AVAILABLE and len(rgb_array) > 1000:  # Use GPU for larger arrays
+        return _rgb_to_hsv_gpu(rgb_array)
+    elif NUMBA_AVAILABLE:
         return _rgb_to_hsv_numba(rgb_array)
     else:
+        return _rgb_to_hsv_numpy(rgb_array)
+
+
+def _rgb_to_hsv_gpu(rgb_array):
+    """
+    GPU-accelerated RGB to HSV conversion using CuPy.
+    Significantly faster for large arrays.
+    """
+    if not CUPY_AVAILABLE:
+        return _rgb_to_hsv_numpy(rgb_array)
+    
+    try:
+        # Transfer to GPU
+        rgb_gpu = cp.asarray(rgb_array)
+        n = rgb_gpu.shape[0]
+        hsv_gpu = cp.zeros((n, 3), dtype=cp.float32)
+        
+        # Vectorized operations on GPU
+        maxc = cp.max(rgb_gpu, axis=1)
+        minc = cp.min(rgb_gpu, axis=1)
+        
+        # Value is the maximum
+        hsv_gpu[:, 2] = maxc
+        
+        # Saturation
+        delta = maxc - minc
+        hsv_gpu[:, 1] = cp.where(maxc != 0, delta / maxc, 0)
+        
+        # Hue calculation - vectorized on GPU
+        h = cp.zeros(n)
+        
+        # Only calculate hue where there's color (delta > 0)
+        mask = delta != 0
+        
+        if cp.any(mask):
+            rgb_masked = rgb_gpu[mask]
+            maxc_masked = maxc[mask]
+            delta_masked = delta[mask]
+            
+            # Red is max
+            red_max = (rgb_masked[:, 0] == maxc_masked)
+            h[mask] = cp.where(red_max, 
+                              (rgb_masked[:, 1] - rgb_masked[:, 2]) / delta_masked,
+                              h[mask])
+            
+            # Green is max
+            green_max = (rgb_masked[:, 1] == maxc_masked) & ~red_max
+            h[mask] = cp.where(green_max,
+                              2.0 + (rgb_masked[:, 2] - rgb_masked[:, 0]) / delta_masked,
+                              h[mask])
+            
+            # Blue is max
+            blue_max = (rgb_masked[:, 2] == maxc_masked) & ~red_max & ~green_max
+            h[mask] = cp.where(blue_max,
+                              4.0 + (rgb_masked[:, 0] - rgb_masked[:, 1]) / delta_masked,
+                              h[mask])
+            
+            # Normalize hue to [0, 1]
+            h[mask] = h[mask] / 6.0
+            h[mask] = cp.where(h[mask] < 0, h[mask] + 1, h[mask])
+        
+        hsv_gpu[:, 0] = h
+        
+        # Transfer back to CPU
+        result = cp.asnumpy(hsv_gpu)
+        print(f"GPU RGB→HSV conversion completed for {n:,} colors")
+        return result
+        
+    except Exception as e:
+        print(f"GPU RGB→HSV conversion failed: {e}, falling back to CPU")
         return _rgb_to_hsv_numpy(rgb_array)
 
 
@@ -1007,6 +1094,85 @@ def _calculate_hsv_distances_numba(image_hsv, wheel_hsv, hue_weight=3.0, sat_wei
     return distances
 
 
+def _calculate_hsv_distances_gpu(image_hsv, wheel_hsv, hue_weight=3.0, sat_weight=1.0, val_weight=0.5):
+    """
+    GPU-accelerated HSV distance calculation using CuPy.
+    Much faster for large distance matrices.
+    """
+    if not CUPY_AVAILABLE:
+        return _calculate_hsv_distances_numpy(image_hsv, wheel_hsv, hue_weight, sat_weight, val_weight)
+    
+    try:
+        # Transfer to GPU
+        image_hsv_gpu = cp.asarray(image_hsv, dtype=cp.float32)
+        wheel_hsv_gpu = cp.asarray(wheel_hsv, dtype=cp.float32)
+        
+        num_image = image_hsv_gpu.shape[0]
+        num_wheel = wheel_hsv_gpu.shape[0]
+        
+        print(f"GPU distance calculation: {num_image:,} × {num_wheel:,} = {num_image * num_wheel:,} comparisons")
+        
+        # Expand dimensions for broadcasting
+        img_h = image_hsv_gpu[:, 0:1]  # Shape: (num_image, 1)
+        img_s = image_hsv_gpu[:, 1:2]
+        img_v = image_hsv_gpu[:, 2:3]
+        
+        wheel_h = wheel_hsv_gpu[:, 0].reshape(1, -1)  # Shape: (1, num_wheel)
+        wheel_s = wheel_hsv_gpu[:, 1].reshape(1, -1)
+        wheel_v = wheel_hsv_gpu[:, 2].reshape(1, -1)
+        
+        # Hue difference (circular, 0-1 range) - vectorized
+        h_diff = cp.abs(img_h - wheel_h)
+        h_diff = cp.minimum(h_diff, 1.0 - h_diff)  # Wrap around for circular hue
+        
+        # Saturation and value differences - vectorized
+        s_diff = img_s - wheel_s
+        v_diff = img_v - wheel_v
+        
+        # Weighted squared Euclidean distance - vectorized
+        distances_gpu = (hue_weight * h_diff * h_diff + 
+                        sat_weight * s_diff * s_diff + 
+                        val_weight * v_diff * v_diff)
+        
+        # Transfer back to CPU
+        result = cp.asnumpy(distances_gpu)
+        print(f"GPU distance calculation completed")
+        return result
+        
+    except Exception as e:
+        print(f"GPU distance calculation failed: {e}, falling back to CPU")
+        return _calculate_hsv_distances_numpy(image_hsv, wheel_hsv, hue_weight, sat_weight, val_weight)
+
+
+def _calculate_hsv_distances_numpy(image_hsv, wheel_hsv, hue_weight=3.0, sat_weight=1.0, val_weight=0.5):
+    """
+    NumPy fallback HSV distance calculation with broadcasting.
+    """
+    # Expand dimensions for broadcasting
+    img_h = image_hsv[:, 0:1]  # Shape: (num_image, 1)
+    img_s = image_hsv[:, 1:2]
+    img_v = image_hsv[:, 2:3]
+    
+    wheel_h = wheel_hsv[:, 0].reshape(1, -1)  # Shape: (1, num_wheel)
+    wheel_s = wheel_hsv[:, 1].reshape(1, -1)
+    wheel_v = wheel_hsv[:, 2].reshape(1, -1)
+    
+    # Hue difference (circular, 0-1 range)
+    h_diff = np.abs(img_h - wheel_h)
+    h_diff = np.minimum(h_diff, 1.0 - h_diff)
+    
+    # Saturation and value differences
+    s_diff = img_s - wheel_s
+    v_diff = img_v - wheel_v
+    
+    # Weighted squared Euclidean distance
+    distances = (hue_weight * h_diff * h_diff + 
+                sat_weight * s_diff * s_diff + 
+                val_weight * v_diff * v_diff)
+    
+    return distances
+
+
 def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, wheel_hsv):
     """
     Fallback vectorized nearest neighbor search with chunked processing.
@@ -1042,35 +1208,15 @@ def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, whe
         chunk_image_hsv = image_hsv[start_idx:end_idx]
         chunk_size_actual = end_idx - start_idx
         
-        # Use JIT-compiled version if available and chunk is large enough
-        if NUMBA_AVAILABLE and chunk_size_actual * num_wheel_colors > 10000:
+        # Choose the best distance calculation method based on available hardware and data size
+        chunk_comparisons = chunk_size_actual * num_wheel_colors
+        
+        if CUPY_AVAILABLE and chunk_comparisons > 50000:  # Use GPU for large computations
+            distances = _calculate_hsv_distances_gpu(chunk_image_hsv, wheel_hsv)
+        elif NUMBA_AVAILABLE and chunk_comparisons > 10000:  # Use Numba JIT for medium computations
             distances = _calculate_hsv_distances_numba(chunk_image_hsv, wheel_hsv)
-        else:
-            # NumPy broadcasting approach for this chunk
-            img_h = chunk_image_hsv[:, None, 0]  # Shape: (chunk_size, 1)
-            img_s = chunk_image_hsv[:, None, 1]  # Shape: (chunk_size, 1) 
-            img_v = chunk_image_hsv[:, None, 2]  # Shape: (chunk_size, 1)
-            
-            wheel_h = wheel_hsv[None, :, 0]  # Shape: (1, M)
-            wheel_s = wheel_hsv[None, :, 1]  # Shape: (1, M)
-            wheel_v = wheel_hsv[None, :, 2]  # Shape: (1, M)
-            
-            # Calculate hue differences with proper wraparound
-            hue_diff = np.abs(img_h - wheel_h)  # Shape: (chunk_size, M)
-            hue_diff = np.minimum(hue_diff, 1 - hue_diff)  # Handle wraparound
-            
-            # Calculate saturation and value differences
-            sat_diff = img_s - wheel_s  # Shape: (chunk_size, M)
-            val_diff = img_v - wheel_v  # Shape: (chunk_size, M)
-            
-            # Weighted distance calculation (vectorized)
-            hue_weight = 3.0    # Hue is most important for wheel position
-            sat_weight = 1.0    # Saturation determines distance from center
-            val_weight = 0.5    # Value is less important for wheel mapping
-            
-            distances = (hue_weight * hue_diff**2 + 
-                        sat_weight * sat_diff**2 + 
-                        val_weight * val_diff**2)  # Shape: (chunk_size, M)
+        else:  # Use NumPy for small computations
+            distances = _calculate_hsv_distances_numpy(chunk_image_hsv, wheel_hsv)
         
         # Find nearest wheel color for each image color in this chunk
         nearest_indices = np.argmin(distances, axis=1)  # Shape: (chunk_size,)
@@ -1114,18 +1260,12 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
     wheel[:, :, :3] = wheel_rgb  # Copy RGB channels
     
-    # Find max percentage for normalization
-    max_percentage = max(color_percentages.values()) if color_percentages else 1.0
-    
-    # Pre-allocate arrays for normalized percentages
+    # Note: color_percentages already contains actual percentages (frequencies/total_pixels)
+    # so they should sum to ~1.0. We'll use them directly for accumulation.
     image_colors = list(color_percentages.keys())
-    percentages_array = np.array(list(color_percentages.values()), dtype=np.float32)
-    normalized_percentages_array = percentages_array / max_percentage
     
-    # Create normalized percentages dictionary 
-    normalized_percentages = {}
-    for i, color in enumerate(image_colors):
-        normalized_percentages[color] = normalized_percentages_array[i]
+    # Use original percentages directly - they're already proper percentages
+    normalized_percentages = color_percentages.copy()
     
     # Pre-allocate opacity values list with estimated size
     estimated_wheel_colors = min(len(color_to_pixels_map), len(image_colors) * 2)  # Rough estimate
@@ -1212,19 +1352,24 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         if normalized_frequency > 0:
             # Map normalized frequency to opacity range (128-255)
             # Using linear mapping for even distribution
+            
             curved_frequency = normalized_frequency  # Linear mapping for even spread
             opacity = int(64 + (255 - 64) * curved_frequency)  # Map to 64-255 range
             opacity_values.append(opacity)  # Collect for histogram
         else:
             opacity = 32  # Low opacity for colors not in image
         
+
+
         # Set opacity for all pixels of this color at once (vectorized)
         if len(pixel_coords) > 0:
             y_coords = pixel_coords[:, 0]
             x_coords = pixel_coords[:, 1]
             wheel[y_coords, x_coords, 3] = opacity
+    
     opacity_mapping_time = time.time() - opacity_mapping_start
     
+
     wheel_time = time.time() - wheel_start
     if image_colors:
         print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
@@ -1579,7 +1724,7 @@ def main():
     parser.add_argument("input_image", help="Path to the input image")
     parser.add_argument("output_wheel", help="Path for the output color wheel image")
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
-    parser.add_argument("--sample-factor", type=int, default=2, 
+    parser.add_argument("--sample-factor", type=int, default=1, 
                        help="Factor to downsample input image for faster processing (default: 4)")
     parser.add_argument("--quantize", type=int, default=8, 
                        help="Color quantization level: 1=no quantization (most precise), higher=more grouping (default: 8)")
@@ -1601,6 +1746,10 @@ def main():
                        help="Force parallel processing for color analysis and computations")
     parser.add_argument("--no-parallel", action="store_true",
                        help="Disable parallel processing and use single-threaded methods")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Force GPU acceleration for computations (requires CuPy)")
+    parser.add_argument("--no-gpu", action="store_true",
+                       help="Disable GPU acceleration and use CPU-only processing")
     parser.add_argument("--color-space", choices=["sRGB", "Adobe RGB", "ProPhoto RGB"], default="sRGB",
                        help="Color space to assume for input image (default: sRGB)")
     
@@ -1626,8 +1775,25 @@ def main():
     elif args.no_parallel:
         use_parallel = False
     
+    # Handle GPU options
+    global CUPY_AVAILABLE
+    if args.gpu and args.no_gpu:
+        print("Error: Cannot specify both --gpu and --no-gpu")
+        return 1
+    elif args.gpu:
+        if not CUPY_AVAILABLE:
+            print("Error: GPU acceleration requested but CuPy is not available")
+            print("Install CuPy: pip install cupy-cuda11x or cupy-cuda12x")
+            return 1
+        print("GPU acceleration forced ON")
+    elif args.no_gpu:
+        CUPY_AVAILABLE = False  # Temporarily disable GPU for this run
+        print("GPU acceleration disabled")
+    
     # Print available optimizations
     optimizations = []
+    if CUPY_AVAILABLE:
+        optimizations.append("GPU acceleration (CuPy)")
     if NUMBA_AVAILABLE:
         optimizations.append("Numba JIT compilation")
     if KDTREE_AVAILABLE:
