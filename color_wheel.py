@@ -13,7 +13,6 @@ import numpy as np
 import cv2
 import argparse
 import colorsys
-import math
 import matplotlib.pyplot as plt
 import pickle
 import os
@@ -21,7 +20,6 @@ import glob
 import time
 import mmap
 import multiprocessing as mp
-from functools import partial
 try:
     from sklearn.neighbors import KDTree
     KDTREE_AVAILABLE = True
