@@ -1466,7 +1466,123 @@ def _apply_opacity_to_wheel(wheel, color_to_pixels_map, wheel_color_frequencies)
     return opacity_values
 
 
-def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None, use_parallel=None):
+def apply_proximity_interpolation(wheel, interpolation_strength=0.3, radius=10, wheel_size=800, inner_radius_ratio=0.1):
+    """
+    Apply proximity-based interpolation to create smoother gradients.
+    
+    For every pixel with opacity > 32 (colors found in image), raise the opacity 
+    of nearby pixels based on distance and interpolation strength.
+    Only affects pixels that are inside the wheel boundary.
+    
+    Args:
+        wheel (numpy.ndarray): RGBA wheel image
+        interpolation_strength (float): Strength of interpolation (0.0 to 1.0)
+        radius (int): Maximum radius for opacity spreading
+        wheel_size (int): Size of the wheel for boundary calculations
+        inner_radius_ratio (float): Inner radius ratio for wheel boundaries
+        
+    Returns:
+        numpy.ndarray: Wheel with proximity-based interpolation applied
+    """
+    if interpolation_strength <= 0:
+        return wheel
+    
+    print(f"Applying proximity interpolation (strength: {interpolation_strength:.2f}, radius: {radius})")
+    interpolation_start = time.time()
+    
+    # Calculate wheel boundaries
+    center = wheel_size // 2
+    outer_radius = center - 10  # Match the template creation
+    inner_radius = int(outer_radius * inner_radius_ratio)
+    
+    # Create wheel mask - only interpolate within the wheel area
+    y_coords, x_coords = np.mgrid[0:wheel_size, 0:wheel_size]
+    dx = x_coords - center
+    dy = y_coords - center
+    distances_from_center = np.sqrt(dx*dx + dy*dy)
+    wheel_mask = (distances_from_center <= outer_radius) & (distances_from_center >= inner_radius)
+    
+    # Work on a copy
+    interpolated_wheel = wheel.copy()
+    original_alpha = wheel[:, :, 3].copy()
+    
+    # Find pixels with colors found in the image (opacity > 32) AND within wheel
+    found_mask = (original_alpha > 32) & wheel_mask
+    found_pixels = np.where(found_mask)
+    
+    if len(found_pixels[0]) == 0:
+        return wheel  # No colors found, nothing to interpolate
+    
+    print(f"Found {len(found_pixels[0]):,} pixels with image colors to interpolate from (within wheel area)")
+    
+    # Create a distance-based kernel for spreading opacity
+    kernel_size = radius * 2 + 1
+    kernel_center = radius
+    
+    # Pre-compute distance weights for the kernel
+    y_kernel, x_kernel = np.mgrid[-radius:radius+1, -radius:radius+1]
+    distances = np.sqrt(x_kernel**2 + y_kernel**2)
+    
+    # Create a falloff function - stronger effect closer to the source pixel
+    # Use inverse quadratic falloff for smooth transitions
+    distance_weights = np.where(
+        distances <= radius,
+        (1.0 - (distances / radius)**2) * interpolation_strength,
+        0.0
+    )
+    
+    height, width = wheel.shape[:2]
+    
+    # For each pixel with found colors, spread its influence to nearby pixels
+    for i in range(len(found_pixels[0])):
+        source_y, source_x = found_pixels[0][i], found_pixels[1][i]
+        source_opacity = original_alpha[source_y, source_x]
+        
+        # Define the region around this pixel to update
+        y_min = max(0, source_y - radius)
+        y_max = min(height, source_y + radius + 1)
+        x_min = max(0, source_x - radius)
+        x_max = min(width, source_x + radius + 1)
+        
+        # Get the corresponding region in the kernel
+        ky_min = max(0, -source_y + radius)
+        ky_max = min(kernel_size, height - source_y + radius)
+        kx_min = max(0, -source_x + radius)
+        kx_max = min(kernel_size, width - source_x + radius)
+        
+        # Extract the relevant portion of the distance weights
+        relevant_weights = distance_weights[ky_min:ky_max, kx_min:kx_max]
+        
+        # Get the current alpha values in the target region
+        current_alpha = interpolated_wheel[y_min:y_max, x_min:x_max, 3]
+        
+        # Get the wheel mask for this region to only affect pixels inside the wheel
+        region_wheel_mask = wheel_mask[y_min:y_max, x_min:x_max]
+        
+        # Calculate the additional opacity to add based on distance and source opacity
+        # Scale the effect by the source opacity (stronger colors spread more)
+        opacity_boost = (relevant_weights * source_opacity * 0.5).astype(np.uint8)
+        
+        # Add the boost to current alpha, but don't exceed 255 or go below current values
+        # Only boost pixels that currently have low opacity AND are within the wheel
+        boost_mask = (current_alpha < 128) & region_wheel_mask  # Only boost dim areas within wheel
+        new_alpha = current_alpha.copy()
+        new_alpha[boost_mask] = np.clip(
+            current_alpha[boost_mask] + opacity_boost[boost_mask], 
+            current_alpha[boost_mask],  # Don't reduce existing opacity
+            255
+        )
+        
+        # Update the interpolated wheel
+        interpolated_wheel[y_min:y_max, x_min:x_max, 3] = new_alpha
+    
+    interpolation_time = time.time() - interpolation_start
+    print(f"Proximity interpolation completed in {format_time(interpolation_time)}")
+    
+    return interpolated_wheel
+
+
+def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None, use_parallel=None, interpolation_strength=0.0, interpolation_radius=0):
     """
     Create a full color wheel where opacity represents color frequency.
     Areas with frequent colors are more opaque.
@@ -1481,6 +1597,8 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         quantize_level (int): Color quantization level used in analysis
         force_kdtree (bool): Force KD-tree usage (True), disable it (False), or auto-detect (None)
         use_parallel (bool): Use parallel processing where applicable (None=auto-detect)
+        interpolation_strength (float): Strength of interpolation (0.0 to 1.0, 0.0 = disabled)
+        interpolation_radius (int): Radius for interpolation spreading (0 = auto-scale)
         
     Returns:
         tuple: (numpy.ndarray, dict, list) - RGBA image of the color wheel, normalized percentages, and opacity values
@@ -1500,6 +1618,11 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     normalized_percentages = color_percentages.copy()
     image_colors = list(normalized_percentages.keys())
     
+    prefilter_time = 0
+    nearest_neighbor_time = 0
+    opacity_mapping_time = 0
+    interpolation_time = 0
+    
     if image_colors:
         # Get color mapping with optional pre-filtering
         color_mapping, prefilter_time, nearest_neighbor_time = _get_color_mapping_with_prefiltering(
@@ -1516,19 +1639,24 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
         opacity_values = _apply_opacity_to_wheel(wheel, color_to_pixels_map, wheel_color_frequencies)
         opacity_mapping_time = time.time() - opacity_mapping_start
         
-        # Print timing summary
-        wheel_time = time.time() - wheel_start
-        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
+        # Apply proximity interpolation if requested
+        if interpolation_strength > 0:
+            interpolation_start = time.time()
+            # Calculate radius - use provided radius or auto-scale with wheel size
+            actual_radius = interpolation_radius if interpolation_radius > 0 else max(5, wheel_size // 80)
+            wheel = apply_proximity_interpolation(wheel, interpolation_strength, actual_radius, wheel_size, inner_radius_ratio)
+            interpolation_time = time.time() - interpolation_start
+        
     else:
         # No colors to process
         opacity_values = []
-        opacity_mapping_time = 0
-        prefilter_time = 0
-        nearest_neighbor_time = 0
-        
-        # Print timing summary
-        wheel_time = time.time() - wheel_start
-        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
+    
+    # Print timing summary
+    wheel_time = time.time() - wheel_start
+    if interpolation_time > 0:
+        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)}, interpolation: {format_time(interpolation_time)})")
+    else:
+        print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
             
     return wheel, normalized_percentages, opacity_values
 
@@ -1853,7 +1981,8 @@ def process_single_image(input_path, output_format, args, output_folder=None):
         # Generate color wheel
         wheel, normalized_percentages, opacity_values = create_color_wheel(
             color_percentages, args.size, quantize_level=args.quantize, 
-            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel
+            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel,
+            interpolation_strength=args.interpolation_strength, interpolation_radius=args.interpolation_radius
         )
         
         # Save the wheel using common function
@@ -1985,6 +2114,10 @@ def create_argument_parser():
                        help="Color space to assume for input image (default: sRGB)")
     parser.add_argument("--output-folder", type=str,
                        help="Output folder for batch processing (created if not exists). If not specified when processing folders, outputs are saved in the same folders as inputs")
+    parser.add_argument("--interpolation-strength", type=float, default=0.0, metavar="0.0-1.0",
+                       help="Strength of interpolation effect (0.0 = none, 1.0 = maximum, default: 0.0)")
+    parser.add_argument("--interpolation-radius", type=int, default=0, metavar="PIXELS",
+                       help="Radius for interpolation spreading in pixels (0 = auto-scale with wheel size, default: 0)")
     return parser
 
 
@@ -2028,6 +2161,15 @@ def validate_and_process_arguments(args):
     elif args.no_gpu:
         CUPY_AVAILABLE = False  # Temporarily disable GPU for this run
         print("GPU acceleration disabled")
+    
+    # Validate interpolation arguments
+    if args.interpolation_strength < 0.0 or args.interpolation_strength > 1.0:
+        print("Error: Interpolation strength must be between 0.0 and 1.0")
+        return 1
+    
+    if args.interpolation_radius < 0:
+        print("Error: Interpolation radius must be >= 0")
+        return 1
     
     # Add processed arguments to args object for easy passing to functions
     args.force_kdtree = force_kdtree
@@ -2167,7 +2309,8 @@ def process_single_file(args):
         print("Generating color wheel...")
         wheel, normalized_percentages, opacity_values = create_color_wheel(
             color_percentages, args.size, quantize_level=args.quantize, 
-            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel
+            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel,
+            interpolation_strength=args.interpolation_strength, interpolation_radius=args.interpolation_radius
         )
         
         # Determine output format and save wheel
