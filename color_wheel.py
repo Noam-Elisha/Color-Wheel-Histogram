@@ -1792,29 +1792,35 @@ def get_supported_image_files(folder_path):
     return image_files
 
 
-def generate_output_filename(input_path, output_format):
+def generate_output_filename(input_path, output_format, output_folder=None):
     """
     Generate output filename by appending '_color_wheel' to the original filename.
     
     Args:
         input_path (str): Path to the input image
         output_format (str): Output format ('jpg' or 'png')
+        output_folder (str, optional): Custom output folder. If None, uses input image's folder
         
     Returns:
         str: Generated output filename
     """
-    # Get directory and base filename without extension
-    directory = os.path.dirname(input_path)
+    # Get base filename without extension
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     
     # Append '_color_wheel' and the requested extension
     output_filename = f"{base_name}_color_wheel.{output_format}"
-    output_path = os.path.join(directory, output_filename)
+    
+    # Use custom output folder or input image's folder
+    if output_folder:
+        output_path = os.path.join(output_folder, output_filename)
+    else:
+        directory = os.path.dirname(input_path)
+        output_path = os.path.join(directory, output_filename)
     
     return output_path
 
 
-def process_single_image(input_path, output_format, args):
+def process_single_image(input_path, output_format, args, output_folder=None):
     """
     Process a single image to generate a color wheel.
     
@@ -1822,16 +1828,20 @@ def process_single_image(input_path, output_format, args):
         input_path (str): Path to the input image
         output_format (str): Output format ('jpg' or 'png')
         args: Parsed arguments object with processing parameters
+        output_folder (str, optional): Custom output folder. If None, uses input image's folder
         
     Returns:
         tuple: (success, input_path, output_path, error_message)
     """
     try:
         # Generate output filename
-        output_path = generate_output_filename(input_path, output_format)
+        output_path = generate_output_filename(input_path, output_format, output_folder)
         
         print(f"\nProcessing: {os.path.basename(input_path)}")
-        print(f"Output: {os.path.basename(output_path)}")
+        if output_folder:
+            print(f"Output: {output_path}")
+        else:
+            print(f"Output: {os.path.basename(output_path)}")
         
         # Load and analyze image
         color_percentages = load_and_analyze_image(
@@ -1884,11 +1894,29 @@ def process_folder(folder_path, output_format, args):
         print("Supported formats: JPG, JPEG, PNG, BMP, TIFF, TIF, WEBP, GIF")
         return 0, 0, 0
     
+    # Handle output folder creation if specified
+    output_folder = getattr(args, 'output_folder', None)
+    if output_folder:
+        if not os.path.exists(output_folder):
+            try:
+                os.makedirs(output_folder, exist_ok=True)
+                print(f"Created output folder: {output_folder}")
+            except Exception as e:
+                print(f"Error: Failed to create output folder '{output_folder}': {e}")
+                return 0, 0, 0
+        elif not os.path.isdir(output_folder):
+            print(f"Error: Output folder path exists but is not a directory: {output_folder}")
+            return 0, 0, 0
+    
     total_files = len(image_files)
     successful_count = 0
     failed_count = 0
     
     print(f"Found {total_files} image files to process in: {folder_path}")
+    if output_folder:
+        print(f"Output folder: {output_folder}")
+    else:
+        print(f"Output location: Same folders as input images")
     print(f"Output format: {output_format.upper()}")
     print("=" * 60)
     
@@ -1898,7 +1926,7 @@ def process_folder(folder_path, output_format, args):
         print(f"[{i}/{total_files}]", end=" ")
         
         success, input_path, output_path, error_msg = process_single_image(
-            image_path, output_format, args
+            image_path, output_format, args, output_folder
         )
         
         if success:
@@ -1925,7 +1953,7 @@ def create_argument_parser():
         description="Generate a color wheel where opacity represents color frequency in an image or folder of images"
     )
     parser.add_argument("input", help="Path to the input image or folder containing images")
-    parser.add_argument("output", nargs='?', help="Path for the output color wheel image (not used when processing folders)")
+    parser.add_argument("output", nargs='?', help="Path for the output color wheel image (only used when processing single images)")
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
     parser.add_argument("--sample-factor", type=int, default=1, 
                        help="Factor to downsample input image for faster processing (default: 1)")
@@ -1955,6 +1983,8 @@ def create_argument_parser():
                        help="Disable GPU acceleration and use CPU-only processing")
     parser.add_argument("--color-space", choices=["sRGB", "Adobe RGB", "ProPhoto RGB"], default="sRGB",
                        help="Color space to assume for input image (default: sRGB)")
+    parser.add_argument("--output-folder", type=str,
+                       help="Output folder for batch processing (created if not exists). If not specified when processing folders, outputs are saved in the same folders as inputs")
     return parser
 
 
@@ -2182,9 +2212,12 @@ def main():
     
     if is_folder:
         # Folder processing mode
-        if args.output is not None:
-            print("Warning: Output parameter is ignored when processing folders.")
-            print("Color wheels will be saved in the same folder as input images with '_color_wheel' suffix.")
+        if args.output is not None and getattr(args, 'output_folder', None) is not None:
+            print("Warning: Both 'output' and '--output-folder' specified. Using '--output-folder' for batch processing.")
+        elif args.output is not None and getattr(args, 'output_folder', None) is None:
+            print("Warning: Output parameter is intended for single images, not folder processing.")
+            print("Use --output-folder to specify where to save batch processed images.")
+            print("Color wheels will be saved in the same folders as input images with '_color_wheel' suffix.")
         
         print(f"Processing folder: {input_path}")
         try:
@@ -2200,6 +2233,9 @@ def main():
             return 1
     else:
         # Single file processing mode
+        if getattr(args, 'output_folder', None) is not None:
+            print("Warning: --output-folder is only used for batch processing folders, not single files.")
+            print("The 'output' parameter will be used for single file processing.")
         return process_single_file(args)
 
 
