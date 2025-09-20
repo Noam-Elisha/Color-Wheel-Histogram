@@ -705,6 +705,107 @@ def _process_color_chunk(chunk):
     return dict(zip(unique_colors, counts))
 
 
+def calculate_hue_frequencies(color_percentages, num_hues=360, saturation_threshold=0.1):
+    """
+    Calculate frequencies for each hue degree based on image colors.
+    
+    Args:
+        color_percentages (dict): Color frequency percentages {(r,g,b): percentage}
+        num_hues (int): Number of hue segments to calculate
+        saturation_threshold (float): Minimum saturation to consider a color
+        
+    Returns:
+        tuple: (hue_degrees, frequencies, image_hsv_data)
+    """
+    hue_degrees = np.arange(num_hues, dtype=np.float32)
+    frequencies = np.zeros(num_hues, dtype=np.float32)
+    
+    if not color_percentages:
+        return hue_degrees, frequencies, None
+    
+    # Convert all image colors to HSV at once
+    image_colors = list(color_percentages.keys())
+    image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0
+    image_hsv = rgb_to_hsv_vectorized(image_colors_array)
+    image_hues = image_hsv[:, 0] * 360  # Convert to degrees
+    image_sats = image_hsv[:, 1]
+    frequencies_array = np.array(list(color_percentages.values()), dtype=np.float32)
+    
+    # Find frequencies for each spectrum hue using vectorized operations
+    for i, spectrum_hue in enumerate(hue_degrees):
+        # Calculate hue differences with wraparound
+        hue_diffs = np.abs(image_hues - spectrum_hue)
+        hue_diffs = np.minimum(hue_diffs, 360 - hue_diffs)
+        
+        # Find colors within threshold
+        hue_mask = (hue_diffs <= 2) & (image_sats > saturation_threshold)  # Within 2 degrees and above saturation threshold
+        
+        if np.any(hue_mask):
+            frequencies[i] = np.max(frequencies_array[hue_mask])
+    
+    return hue_degrees, frequencies, (image_hues, image_sats, frequencies_array)
+
+
+def convert_rgba_to_rgb(rgba_image, background_color=0):
+    """
+    Convert RGBA image to RGB by blending with background color.
+    
+    Args:
+        rgba_image (np.ndarray): RGBA image array
+        background_color (int or tuple): Background color for blending (0=black, 255=white)
+        
+    Returns:
+        np.ndarray: RGB image array
+    """
+    rgb_image = np.zeros((rgba_image.shape[0], rgba_image.shape[1], 3), dtype=np.uint8)
+    alpha = rgba_image[:, :, 3] / 255.0  # Normalize alpha to 0-1
+    
+    if isinstance(background_color, (int, float)):
+        # Single value background (grayscale)
+        for i in range(3):  # RGB channels
+            rgb_image[:, :, i] = (rgba_image[:, :, i] * alpha + background_color * (1 - alpha)).astype(np.uint8)
+    else:
+        # RGB tuple background
+        for i in range(3):  # RGB channels
+            rgb_image[:, :, i] = (rgba_image[:, :, i] * alpha + background_color[i] * (1 - alpha)).astype(np.uint8)
+    
+    return rgb_image
+
+
+def hsv_to_rgb_vectorized(hsv_array):
+    """
+    Convert HSV colors to RGB using vectorized operations.
+    
+    Args:
+        hsv_array (np.ndarray): HSV values with shape (N, 3), values in range [0, 1]
+        
+    Returns:
+        np.ndarray: RGB values with shape (N, 3), values in range [0, 1]
+    """
+    h, s, v = hsv_array[:, 0], hsv_array[:, 1], hsv_array[:, 2]
+    
+    c = v * s
+    x = c * (1 - np.abs(((h * 6) % 2) - 1))
+    m = v - c
+    
+    # Initialize RGB arrays
+    r = np.zeros_like(h)
+    g = np.zeros_like(h)
+    b = np.zeros_like(h)
+    
+    # Determine RGB based on hue sector
+    h_sector = (h * 6).astype(int) % 6
+    
+    mask0 = h_sector == 0; r[mask0] = c[mask0]; g[mask0] = x[mask0]
+    mask1 = h_sector == 1; r[mask1] = x[mask1]; g[mask1] = c[mask1]
+    mask2 = h_sector == 2; g[mask2] = c[mask2]; b[mask2] = x[mask2]
+    mask3 = h_sector == 3; g[mask3] = x[mask3]; b[mask3] = c[mask3]
+    mask4 = h_sector == 4; r[mask4] = x[mask4]; b[mask4] = c[mask4]
+    mask5 = h_sector == 5; r[mask5] = c[mask5]; b[mask5] = x[mask5]
+    
+    return np.column_stack([r + m, g + m, b + m])
+
+
 def rgb_to_hsv_normalized(r, g, b):
     """
     Convert RGB values (0-255) to HSV values.
@@ -1230,6 +1331,142 @@ def _find_nearest_vectorized_fallback(image_colors, image_hsv, wheel_colors, whe
     
     return color_mapping
 
+           
+def _get_color_mapping_with_prefiltering(image_colors, normalized_percentages, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel, quantize_level):
+    """
+    Get color mapping from image colors to wheel colors, with optional pre-filtering for large datasets.
+    
+    Returns:
+        tuple: (color_mapping, prefilter_time, nearest_neighbor_time)
+    """
+    prefilter_time = 0
+    
+    if len(image_colors) > 1000:  # Only pre-filter for large color sets
+        prefilter_start = time.time()
+        # More aggressive threshold for better reduction
+        threshold = max(4, quantize_level * 2)  # Larger threshold for more reduction
+        filtered_percentages, original_to_filtered_mapping = prefilter_and_deduplicate_colors(
+            normalized_percentages, 
+            similarity_threshold=threshold
+        )
+        filtered_colors = list(filtered_percentages.keys())
+        prefilter_time = time.time() - prefilter_start
+        
+        # Only use filtered results if we got significant reduction (>20%)
+        reduction_ratio = len(filtered_colors) / len(image_colors)
+        if reduction_ratio < 0.8:  # If we reduced by more than 20%
+            # Do nearest-neighbor search on filtered (reduced) set
+            nearest_neighbor_start = time.time()
+            filtered_color_mapping = find_nearest_wheel_colors_vectorized(filtered_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+            nearest_neighbor_time = time.time() - nearest_neighbor_start
+            
+            # Expand the filtered mapping back to original colors
+            color_mapping = {}
+            for original_color in image_colors:
+                filtered_color = original_to_filtered_mapping[original_color]
+                nearest_wheel_color = filtered_color_mapping[filtered_color]
+                color_mapping[original_color] = nearest_wheel_color
+            
+            print(f"Pre-filtering saved {len(image_colors) - len(filtered_colors):,} nearest-neighbor searches ({prefilter_time*1000:.1f}ms)")
+            return color_mapping, prefilter_time, nearest_neighbor_time
+        else:
+            # Pre-filtering didn't help enough, use original approach
+            print(f"Pre-filtering reduction too small ({reduction_ratio:.1%}), using direct search")
+            prefilter_time = 0
+    else:
+        # Skip pre-filtering for small color sets
+        print(f"Skipping pre-filtering for small color set ({len(image_colors):,} colors)")
+    
+    # Direct search without pre-filtering
+    nearest_neighbor_start = time.time()
+    color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
+    nearest_neighbor_time = time.time() - nearest_neighbor_start
+    
+    return color_mapping, prefilter_time, nearest_neighbor_time
+
+
+def _accumulate_wheel_color_frequencies(normalized_percentages, color_mapping):
+    """
+    Accumulate frequencies for wheel colors from image color mappings.
+    
+    Returns:
+        dict: Mapping of wheel colors to accumulated frequencies
+    """
+    wheel_color_frequencies = {}
+    
+    for image_color, percentage in normalized_percentages.items():
+        nearest_wheel_color = color_mapping[image_color]
+        
+        if nearest_wheel_color in wheel_color_frequencies:
+            wheel_color_frequencies[nearest_wheel_color] += percentage
+        else:
+            wheel_color_frequencies[nearest_wheel_color] = percentage
+    
+    return wheel_color_frequencies
+
+
+def _normalize_wheel_frequencies(wheel_color_frequencies):
+    """
+    Normalize wheel color frequencies to [0, 1] range.
+    
+    Returns:
+        dict: Normalized frequency mapping
+    """
+    if not wheel_color_frequencies:
+        return {}
+    
+    max_accumulated_freq = max(wheel_color_frequencies.values())
+    min_accumulated_freq = min(wheel_color_frequencies.values())
+    freq_range = max_accumulated_freq - min_accumulated_freq
+    
+    if freq_range > 0:
+        # Normalize to [0, 1] range: (value - min) / (max - min)
+        for wheel_color in wheel_color_frequencies:
+            wheel_color_frequencies[wheel_color] = (wheel_color_frequencies[wheel_color] - min_accumulated_freq) / freq_range
+        print(f"Frequency normalization: {min_accumulated_freq:.6f} → 0.0, {max_accumulated_freq:.6f} → 1.0")
+    else:
+        # All frequencies are the same, set them to 1.0
+        for wheel_color in wheel_color_frequencies:
+            wheel_color_frequencies[wheel_color] = 1.0
+        print(f"All wheel colors have equal frequency: {max_accumulated_freq:.6f}")
+    
+    # Debug: show frequency distribution
+    freq_values = list(wheel_color_frequencies.values())
+    print(f"Final frequency range: {min(freq_values):.6f} to {max(freq_values):.6f} (wheel colors: {len(wheel_color_frequencies)})")
+    
+    return wheel_color_frequencies
+
+
+def _apply_opacity_to_wheel(wheel, color_to_pixels_map, wheel_color_frequencies):
+    """
+    Apply opacity values to the wheel based on color frequencies.
+    
+    Returns:
+        list: List of opacity values for histogram generation
+    """
+    opacity_values = []
+    
+    for quantized_color, pixel_coords in color_to_pixels_map.items():
+        # Get the accumulated frequency for this wheel color
+        normalized_frequency = wheel_color_frequencies.get(quantized_color, 0)
+        
+        # Calculate opacity based on frequency
+        if normalized_frequency > 0:
+            # Map normalized frequency to opacity range with curve mapping for even spread
+            curved_frequency = normalized_frequency ** 0.25
+            opacity = int(64 + (255 - 64) * curved_frequency)  # Map to 64-255 range
+            opacity_values.append(opacity)  # Collect for histogram
+        else:
+            opacity = 32  # Low opacity for colors not in image
+        
+        # Set opacity for all pixels of this color at once (vectorized)
+        if len(pixel_coords) > 0:
+            y_coords = pixel_coords[:, 0]
+            x_coords = pixel_coords[:, 1]
+            wheel[y_coords, x_coords, 3] = opacity
+    
+    return opacity_values
+
 
 def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1, quantize_level=8, force_kdtree=None, use_parallel=None):
     """
@@ -1261,137 +1498,38 @@ def create_color_wheel(color_percentages, wheel_size=800, inner_radius_ratio=0.1
     wheel = np.zeros((wheel_size, wheel_size, 4), dtype=np.uint8)
     wheel[:, :, :3] = wheel_rgb  # Copy RGB channels
     
-    # Note: color_percentages already contains actual percentages (frequencies/total_pixels)
-    # so they should sum to ~1.0. We'll use them directly for accumulation.
-    image_colors = list(color_percentages.keys())
-    
     # Use original percentages directly - they're already proper percentages
     normalized_percentages = color_percentages.copy()
-    
-    # Pre-allocate opacity values list with estimated size
-    estimated_wheel_colors = min(len(color_to_pixels_map), len(image_colors) * 2)  # Rough estimate
-    opacity_values = []  # Python lists grow dynamically, no need to pre-reserve
-    
-    # NEW APPROACH: Map each input image color to the nearest color in the wheel template
-    # VECTORIZED: Do all color mappings at once for massive speed improvement
-    # CACHED: Use pre-computed HSV values for wheel colors
-    # SPATIAL INDEXING: Use KD-tree for large datasets
-    # PARALLEL: Use JIT compilation and multiprocessing for performance
-    wheel_color_frequencies = {}
-    
-    # Get all image colors and do vectorized nearest-neighbor lookup using cached HSV
     image_colors = list(normalized_percentages.keys())
-    prefilter_time = 0  # Initialize timing variables
-    nearest_neighbor_time = 0
     
     if image_colors:
-        # PRE-FILTERING: Group similar colors to reduce search complexity
-        # Only use pre-filtering if we have enough colors to make it worthwhile
-        if len(image_colors) > 1000:  # Only pre-filter for large color sets
-            prefilter_start = time.time()
-            # More aggressive threshold for better reduction
-            threshold = max(4, quantize_level * 2)  # Larger threshold for more reduction
-            filtered_percentages, original_to_filtered_mapping = prefilter_and_deduplicate_colors(
-                normalized_percentages, 
-                similarity_threshold=threshold
-            )
-            filtered_colors = list(filtered_percentages.keys())
-            prefilter_time = time.time() - prefilter_start
-            
-            # Only use filtered results if we got significant reduction (>20%)
-            reduction_ratio = len(filtered_colors) / len(image_colors)
-            if reduction_ratio < 0.8:  # If we reduced by more than 20%
-                # Do nearest-neighbor search on filtered (reduced) set
-                nearest_neighbor_start = time.time()
-                filtered_color_mapping = find_nearest_wheel_colors_vectorized(filtered_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
-                nearest_neighbor_time = time.time() - nearest_neighbor_start
-                
-                # Expand the filtered mapping back to original colors
-                color_mapping = {}
-                for original_color in image_colors:
-                    filtered_color = original_to_filtered_mapping[original_color]
-                    nearest_wheel_color = filtered_color_mapping[filtered_color]
-                    color_mapping[original_color] = nearest_wheel_color
-                
-                print(f"Pre-filtering saved {len(image_colors) - len(filtered_colors):,} nearest-neighbor searches ({prefilter_time*1000:.1f}ms)")
-            else:
-                # Pre-filtering didn't help enough, use original approach
-                print(f"Pre-filtering reduction too small ({reduction_ratio:.1%}), using direct search")
-                prefilter_time = 0
-                nearest_neighbor_start = time.time()
-                color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
-                nearest_neighbor_time = time.time() - nearest_neighbor_start
-        else:
-            # Skip pre-filtering for small color sets
-            print(f"Skipping pre-filtering for small color set ({len(image_colors):,} colors)")
-            prefilter_time = 0
-            nearest_neighbor_start = time.time()
-            color_mapping = find_nearest_wheel_colors_vectorized(image_colors, color_to_pixels_map, wheel_hsv_cache, force_kdtree, use_parallel)
-            nearest_neighbor_time = time.time() - nearest_neighbor_start
+        # Get color mapping with optional pre-filtering
+        color_mapping, prefilter_time, nearest_neighbor_time = _get_color_mapping_with_prefiltering(
+            image_colors, normalized_percentages, color_to_pixels_map, wheel_hsv_cache, 
+            force_kdtree, use_parallel, quantize_level
+        )
         
-        # Accumulate frequencies for wheel colors using original percentages
-        for image_color, percentage in normalized_percentages.items():
-            nearest_wheel_color = color_mapping[image_color]
-            
-            if nearest_wheel_color in wheel_color_frequencies:
-                wheel_color_frequencies[nearest_wheel_color] += percentage
-            else:
-                wheel_color_frequencies[nearest_wheel_color] = percentage
-    
-    # Normalize accumulated frequencies: most frequent wheel color = 1.0, least frequent = 0.0
-    # This ensures proper opacity mapping regardless of how many input colors map to wheel colors
-    max_accumulated_freq = max(wheel_color_frequencies.values()) if wheel_color_frequencies else 1.0
-    min_accumulated_freq = min(wheel_color_frequencies.values()) if wheel_color_frequencies else 0.0
-    freq_range = max_accumulated_freq - min_accumulated_freq
-    
-    if freq_range > 0:
-        # Normalize to [0, 1] range: (value - min) / (max - min)
-        for wheel_color in wheel_color_frequencies:
-            wheel_color_frequencies[wheel_color] = (wheel_color_frequencies[wheel_color] - min_accumulated_freq) / freq_range
-        print(f"Frequency normalization: {min_accumulated_freq:.6f} → 0.0, {max_accumulated_freq:.6f} → 1.0")
-    else:
-        # All frequencies are the same, set them to 1.0
-        for wheel_color in wheel_color_frequencies:
-            wheel_color_frequencies[wheel_color] = 1.0
-        print(f"All wheel colors have equal frequency: {max_accumulated_freq:.6f}")
-    
-    # Debug: show frequency distribution
-    if wheel_color_frequencies:
-        freq_values = list(wheel_color_frequencies.values())
-        print(f"Final frequency range: {min(freq_values):.6f} to {max(freq_values):.6f} (wheel colors: {len(wheel_color_frequencies)})")
-    
-    # Now apply frequencies to the wheel using the mapped colors
-    opacity_mapping_start = time.time()
-    for quantized_color, pixel_coords in color_to_pixels_map.items():
-        # Get the accumulated frequency for this wheel color
-        normalized_frequency = wheel_color_frequencies.get(quantized_color, 0)
+        # Accumulate and normalize frequencies
+        wheel_color_frequencies = _accumulate_wheel_color_frequencies(normalized_percentages, color_mapping)
+        wheel_color_frequencies = _normalize_wheel_frequencies(wheel_color_frequencies)
         
-        # Calculate opacity based on frequency
-        if normalized_frequency > 0:
-            # Map normalized frequency to opacity range (128-255)
-            # Using linear mapping for even distribution
-            
-            curved_frequency = normalized_frequency ** 0.25 # curve mapping for even spread
-            opacity = int(64 + (255 - 64) * curved_frequency)  # Map to 64-255 range
-            opacity_values.append(opacity)  # Collect for histogram
-        else:
-            opacity = 32  # Low opacity for colors not in image
+        # Apply opacity to wheel
+        opacity_mapping_start = time.time()
+        opacity_values = _apply_opacity_to_wheel(wheel, color_to_pixels_map, wheel_color_frequencies)
+        opacity_mapping_time = time.time() - opacity_mapping_start
         
-
-
-        # Set opacity for all pixels of this color at once (vectorized)
-        if len(pixel_coords) > 0:
-            y_coords = pixel_coords[:, 0]
-            x_coords = pixel_coords[:, 1]
-            wheel[y_coords, x_coords, 3] = opacity
-    
-    opacity_mapping_time = time.time() - opacity_mapping_start
-    
-
-    wheel_time = time.time() - wheel_start
-    if image_colors:
+        # Print timing summary
+        wheel_time = time.time() - wheel_start
         print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, pre-filtering: {format_time(prefilter_time)}, nearest-neighbor: {format_time(nearest_neighbor_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
     else:
+        # No colors to process
+        opacity_values = []
+        opacity_mapping_time = 0
+        prefilter_time = 0
+        nearest_neighbor_time = 0
+        
+        # Print timing summary
+        wheel_time = time.time() - wheel_start
         print(f"Wheel generation completed in {format_time(wheel_time)} (template: {format_time(template_time)}, opacity mapping: {format_time(opacity_mapping_time)})")
             
     return wheel, normalized_percentages, opacity_values
@@ -1481,53 +1619,11 @@ def create_color_spectrum_histogram(color_percentages, output_path, width=1200, 
         np.ones(spectrum_width, dtype=np.float32)   # V: 1.0 (full value)
     ])
     
-    # Convert spectrum HSV to RGB using vectorized conversion
-    def hsv_to_rgb_vectorized_simple(hsv_array):
-        h, s, v = hsv_array[:, 0], hsv_array[:, 1], hsv_array[:, 2]
-        
-        c = v * s
-        x = c * (1 - np.abs(((h * 6) % 2) - 1))
-        m = v - c
-        
-        # Pre-allocate RGB arrays
-        r = np.zeros_like(h)
-        g = np.zeros_like(h)
-        b = np.zeros_like(h)
-        
-        # Determine RGB based on hue sector
-        h_sector = (h * 6).astype(int) % 6
-        
-        mask0 = h_sector == 0; r[mask0] = c[mask0]; g[mask0] = x[mask0]
-        mask1 = h_sector == 1; r[mask1] = x[mask1]; g[mask1] = c[mask1]
-        mask2 = h_sector == 2; g[mask2] = c[mask2]; b[mask2] = x[mask2]
-        mask3 = h_sector == 3; g[mask3] = x[mask3]; b[mask3] = c[mask3]
-        mask4 = h_sector == 4; r[mask4] = x[mask4]; b[mask4] = c[mask4]
-        mask5 = h_sector == 5; r[mask5] = c[mask5]; b[mask5] = x[mask5]
-        
-        return np.column_stack([r + m, g + m, b + m])
+    # Convert spectrum HSV to RGB using global vectorized conversion
+    spectrum_colors = hsv_to_rgb_vectorized(spectrum_hsv)
     
-    spectrum_colors = hsv_to_rgb_vectorized_simple(spectrum_hsv)
-    
-    # VECTORIZED: Convert all image colors to HSV at once if there are any
-    if color_percentages:
-        image_colors = list(color_percentages.keys())
-        image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0
-        image_hsv = rgb_to_hsv_vectorized(image_colors_array)
-        image_hues = image_hsv[:, 0] * 360  # Convert to degrees
-        image_sats = image_hsv[:, 1]
-        frequencies_array = np.array(list(color_percentages.values()), dtype=np.float32)
-        
-        # Find frequencies for each spectrum hue using vectorized operations
-        for i, spectrum_hue in enumerate(hue_degrees):
-            # Calculate hue differences with wraparound
-            hue_diffs = np.abs(image_hues - spectrum_hue)
-            hue_diffs = np.minimum(hue_diffs, 360 - hue_diffs)
-            
-            # Find colors within threshold
-            hue_mask = (hue_diffs <= 2) & (image_sats > 0.3)  # Within 2 degrees and not too gray
-            
-            if np.any(hue_mask):
-                frequencies[i] = np.max(frequencies_array[hue_mask])
+    # VECTORIZED: Calculate hue frequencies using common function
+    hue_degrees, frequencies, _ = calculate_hue_frequencies(color_percentages, spectrum_width, saturation_threshold=0.3)
     
     # Create the plot
     fig, ax = plt.subplots(figsize=(width/100, height/100))
@@ -1602,88 +1698,26 @@ def create_circular_color_spectrum(color_percentages, output_path, size=800):
     inner_radius = 0.3  # Inner circle radius
     max_spike_length = 0.6  # Maximum spike length
     
-    # VECTORIZED: Convert all image colors to HSV at once
-    if color_percentages:
-        image_colors = list(color_percentages.keys())
-        image_colors_array = np.array(image_colors, dtype=np.float32) / 255.0
-        image_hsv = rgb_to_hsv_vectorized(image_colors_array)  # Shape: (N, 3)
-        image_hues = image_hsv[:, 0] * 360  # Convert to degrees
-        image_sats = image_hsv[:, 1]
-        frequencies_array = np.array(list(color_percentages.values()), dtype=np.float32)
+    # VECTORIZED: Calculate hue frequencies using common function
+    hue_degrees, frequencies, hsv_data = calculate_hue_frequencies(color_percentages, num_segments, saturation_threshold=0.1)
+    
+    # Extract HSV data for further processing
+    if hsv_data:
+        image_hues, image_sats, frequencies_array = hsv_data
     else:
         image_hues = np.array([])
         image_sats = np.array([])
         frequencies_array = np.array([])
     
     # VECTORIZED: Generate spectrum colors
-    hue_degrees = np.arange(num_segments, dtype=np.float32)
     spectrum_hsv = np.column_stack([
         hue_degrees / 360.0,  # H: 0-1
         np.ones(num_segments, dtype=np.float32),  # S: 1.0 (full saturation)
         np.ones(num_segments, dtype=np.float32)   # V: 1.0 (full value)
     ])
     
-    # Convert spectrum HSV to RGB using our vectorized function
-    # Note: rgb_to_hsv_vectorized works in reverse too, but we need HSV->RGB
-    # Let's use a vectorized HSV to RGB conversion
-    def hsv_to_rgb_vectorized(hsv_array):
-        h, s, v = hsv_array[:, 0], hsv_array[:, 1], hsv_array[:, 2]
-        
-        c = v * s
-        x = c * (1 - np.abs(((h * 6) % 2) - 1))
-        m = v - c
-        
-        # Initialize RGB arrays
-        r = np.zeros_like(h)
-        g = np.zeros_like(h)
-        b = np.zeros_like(h)
-        
-        # Determine RGB based on hue sector
-        h_sector = (h * 6).astype(int) % 6
-        
-        mask0 = h_sector == 0
-        r[mask0] = c[mask0]
-        g[mask0] = x[mask0]
-        
-        mask1 = h_sector == 1
-        r[mask1] = x[mask1]
-        g[mask1] = c[mask1]
-        
-        mask2 = h_sector == 2
-        g[mask2] = c[mask2]
-        b[mask2] = x[mask2]
-        
-        mask3 = h_sector == 3
-        g[mask3] = x[mask3]
-        b[mask3] = c[mask3]
-        
-        mask4 = h_sector == 4
-        r[mask4] = x[mask4]
-        b[mask4] = c[mask4]
-        
-        mask5 = h_sector == 5
-        r[mask5] = c[mask5]
-        b[mask5] = x[mask5]
-        
-        return np.column_stack([r + m, g + m, b + m])
-    
+    # Convert spectrum HSV to RGB using global vectorized function
     spectrum_rgb = hsv_to_rgb_vectorized(spectrum_hsv)  # Shape: (360, 3)
-    
-    # VECTORIZED: Calculate frequencies for each spectrum hue
-    frequencies = np.zeros(num_segments, dtype=np.float32)
-    
-    if len(image_hues) > 0:
-        # For each spectrum hue, find matching image colors
-        for i, spectrum_hue in enumerate(hue_degrees):
-            # Calculate hue differences with wraparound
-            hue_diffs = np.abs(image_hues - spectrum_hue)
-            hue_diffs = np.minimum(hue_diffs, 360 - hue_diffs)
-            
-            # Find colors within threshold
-            hue_mask = (hue_diffs <= 2) & (image_sats > 0.1)  # Within 2 degrees and not too desaturated
-            
-            if np.any(hue_mask):
-                frequencies[i] = np.max(frequencies_array[hue_mask])
     
     # Normalize frequencies for spike lengths
     max_freq = np.max(frequencies) if np.any(frequencies > 0) else 1
@@ -1814,59 +1848,19 @@ def process_single_image(input_path, output_format, args):
             force_kdtree=args.force_kdtree, use_parallel=args.use_parallel
         )
         
-        # Save the wheel in the specified format
-        if output_format == "jpg":
-            # Convert RGBA to RGB by blending with black background
-            rgb_wheel = np.zeros((wheel.shape[0], wheel.shape[1], 3), dtype=np.uint8)
-            alpha = wheel[:, :, 3] / 255.0
-            
-            for i in range(3):
-                rgb_wheel[:, :, i] = (wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)
-            
-            wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]
-            success = cv2.imwrite(output_path, wheel_bgr)
-        else:  # PNG format
-            wheel = wheel.astype(np.uint8)
-            wheel_bgra = wheel[:, :, [2, 1, 0, 3]]
-            success = cv2.imwrite(output_path, wheel_bgra)
+        # Save the wheel using common function
+        success, final_output_path = save_wheel_image(wheel, output_path, output_format)
         
         if not success:
             return False, input_path, output_path, "Failed to save image"
         
-        # Generate additional outputs if requested
-        if args.show_reference:
-            reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
-            
-            if output_format == "jpg":
-                rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
-                alpha = reference_wheel[:, :, 3] / 255.0
-                for i in range(3):
-                    rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)
-                reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
-                reference_path = output_path.replace(f'.{output_format}', f'_reference.{output_format}')
-                cv2.imwrite(reference_path, reference_wheel_bgr)
-            else:
-                reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
-                reference_path = output_path.replace(f'.{output_format}', f'_reference.{output_format}')
-                cv2.imwrite(reference_path, reference_wheel_bgra)
-            
-            print(f"Reference wheel saved to: {os.path.basename(reference_path)}")
+        # Generate additional outputs using common function
+        save_reference_wheel(args, final_output_path, output_format)
+        generate_additional_outputs(args, final_output_path, color_percentages, opacity_values)
         
-        if args.histogram:
-            histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
-            create_opacity_histogram(opacity_values, histogram_path)
+        print(f"✓ Color wheel saved to: {os.path.basename(final_output_path)}")
         
-        if args.color_spectrum:
-            spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
-            create_color_spectrum_histogram(color_percentages, spectrum_path)
-        
-        if args.circular_spectrum:
-            circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
-            create_circular_color_spectrum(color_percentages, circular_path)
-        
-        print(f"✓ Color wheel saved to: {os.path.basename(output_path)}")
-        
-        return True, input_path, output_path, None
+        return True, input_path, final_output_path, None
         
     except Exception as e:
         return False, input_path, "", str(e)
@@ -1927,8 +1921,8 @@ def process_folder(folder_path, output_format, args):
     return successful_count, failed_count, total_files
 
 
-def main():
-    """Main function to run the color wheel generator."""
+def create_argument_parser():
+    """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
         description="Generate a color wheel where opacity represents color frequency in an image or folder of images"
     )
@@ -1963,9 +1957,15 @@ def main():
                        help="Disable GPU acceleration and use CPU-only processing")
     parser.add_argument("--color-space", choices=["sRGB", "Adobe RGB", "ProPhoto RGB"], default="sRGB",
                        help="Color space to assume for input image (default: sRGB)")
+    return parser
+
+
+def validate_and_process_arguments(args):
+    """Validate arguments and set derived configuration values.
     
-    args = parser.parse_args()
-    
+    Returns:
+        int: 0 for success, 1 for error
+    """
     # Handle KD-tree options
     force_kdtree = None
     if args.force_kdtree and args.no_kdtree:
@@ -2001,7 +2001,14 @@ def main():
         CUPY_AVAILABLE = False  # Temporarily disable GPU for this run
         print("GPU acceleration disabled")
     
-    # Print available optimizations
+    # Add processed arguments to args object for easy passing to functions
+    args.force_kdtree = force_kdtree
+    args.use_parallel = use_parallel
+    return 0
+
+
+def show_available_optimizations():
+    """Display available optimization methods."""
     optimizations = []
     if CUPY_AVAILABLE:
         optimizations.append("GPU acceleration (CuPy)")
@@ -2014,10 +2021,162 @@ def main():
     
     if optimizations:
         print(f"Available optimizations: {', '.join(optimizations)}")
+
+
+def save_wheel_image(wheel, output_path, format_to_use):
+    """Save the color wheel in the specified format.
     
-    # Add processed arguments to args object for easy passing to functions
-    args.force_kdtree = force_kdtree
-    args.use_parallel = use_parallel
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if format_to_use == "jpg":
+        # JPG doesn't support transparency, so blend with black background
+        if not output_path.lower().endswith(('.jpg', '.jpeg')):
+            output_path = output_path.rsplit('.', 1)[0] + '.jpg'
+            print(f"Changed output format to JPG: {output_path}")
+        
+        # Convert RGBA to RGB by blending with black background
+        rgb_wheel = convert_rgba_to_rgb(wheel, background_color=0)
+        
+        # Convert RGB to BGR for OpenCV
+        wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]  # RGB -> BGR
+        return cv2.imwrite(output_path, wheel_bgr), output_path
+        
+    else:  # PNG format
+        # Ensure output filename has .png extension for RGBA support
+        if not output_path.lower().endswith('.png'):
+            output_path = output_path.rsplit('.', 1)[0] + '.png'
+            print(f"Changed output format to PNG for transparency support: {output_path}")
+        
+        # Ensure wheel array is proper uint8 format
+        wheel = wheel.astype(np.uint8)
+        
+        # Save directly as RGBA PNG (no conversion needed)
+        # OpenCV expects BGR or BGRA, so convert RGBA to BGRA
+        wheel_bgra = wheel[:, :, [2, 1, 0, 3]]  # Swap R and B channels: RGBA -> BGRA
+        return cv2.imwrite(output_path, wheel_bgra), output_path
+
+
+def save_reference_wheel(args, output_path, format_to_use):
+    """Save reference wheel if requested."""
+    if not args.show_reference:
+        return
+    
+    reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
+    
+    if format_to_use == "jpg":
+        # Convert reference wheel to RGB with black background
+        rgb_ref = convert_rgba_to_rgb(reference_wheel, background_color=0)
+        
+        reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
+        reference_path = output_path.replace('.jpg', '_reference.jpg').replace('.jpeg', '_reference.jpg')
+        cv2.imwrite(reference_path, reference_wheel_bgr)
+    else:
+        reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
+        reference_path = output_path.replace('.png', '_reference.png')
+        cv2.imwrite(reference_path, reference_wheel_bgra)
+        
+    print(f"Reference wheel saved to: {reference_path}")
+
+
+def generate_additional_outputs(args, output_path, color_percentages, opacity_values):
+    """Generate histogram and spectrum outputs if requested."""
+    if args.histogram:
+        print("Generating opacity histogram...")
+        histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
+        create_opacity_histogram(opacity_values, histogram_path)
+        
+    if args.color_spectrum:
+        print("Generating color spectrum histogram...")
+        spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
+        create_color_spectrum_histogram(color_percentages, spectrum_path)
+        
+    if args.circular_spectrum:
+        print("Generating circular color spectrum...")
+        circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
+        create_circular_color_spectrum(color_percentages, circular_path)
+
+
+def determine_output_format(args, output_path):
+    """Determine the output format based on arguments and file extension."""
+    if args.format == "png" and output_path.lower().endswith(('.jpg', '.jpeg')):
+        print("Auto-detected JPG format from file extension")
+        return "jpg"
+    elif args.format == "jpg" and output_path.lower().endswith('.png'):
+        print("Auto-detected PNG format from file extension")
+        return "png"
+    else:
+        return args.format
+
+
+def process_single_file(args):
+    """Process a single image file.
+    
+    Returns:
+        int: 0 for success, 1 for error
+    """
+    input_path = args.input
+    
+    if not os.path.isfile(input_path):
+        print(f"Error: Input file does not exist: {input_path}")
+        return 1
+    
+    if args.output is None:
+        print("Error: Output path is required when processing a single image.")
+        print("Usage: python color_wheel.py input_image.jpg output_wheel.png")
+        return 1
+    
+    try:
+        total_start = time.time()
+        
+        print(f"Loading and analyzing image: {input_path}")
+        color_percentages = load_and_analyze_image(
+            input_path, args.sample_factor, args.quantize, 
+            args.use_parallel, args.color_space
+        )
+        print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
+        
+        print("Generating color wheel...")
+        wheel, normalized_percentages, opacity_values = create_color_wheel(
+            color_percentages, args.size, quantize_level=args.quantize, 
+            force_kdtree=args.force_kdtree, use_parallel=args.use_parallel
+        )
+        
+        # Determine output format and save wheel
+        format_to_use = determine_output_format(args, args.output)
+        success, final_output_path = save_wheel_image(wheel, args.output, format_to_use)
+        
+        if not success:
+            print(f"Error: Failed to save image to {final_output_path}")
+            return 1
+        
+        print(f"Color wheel saved to: {final_output_path}")
+        
+        # Save additional outputs
+        save_reference_wheel(args, final_output_path, format_to_use)
+        generate_additional_outputs(args, final_output_path, color_percentages, opacity_values)
+        
+        total_time = time.time() - total_start
+        print(f"\nTotal processing completed in {format_time(total_time)}")
+        return 0
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def main():
+    """Main function to run the color wheel generator."""
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    
+    # Validate arguments and process configuration
+    result = validate_and_process_arguments(args)
+    if result != 0:
+        return result
+    
+    # Show available optimizations
+    show_available_optimizations()
     
     # Determine if input is a file or folder
     input_path = args.input
@@ -2041,125 +2200,9 @@ def main():
         except Exception as e:
             print(f"Error processing folder: {e}")
             return 1
-    
     else:
         # Single file processing mode
-        if not os.path.isfile(input_path):
-            print(f"Error: Input file does not exist: {input_path}")
-            return 1
-        
-        if args.output is None:
-            print("Error: Output path is required when processing a single image.")
-            print("Usage: python color_wheel.py input_image.jpg output_wheel.png")
-            return 1
-        
-        try:
-            total_start = time.time()
-            
-            print(f"Loading and analyzing image: {input_path}")
-            color_percentages = load_and_analyze_image(input_path, args.sample_factor, args.quantize, use_parallel, args.color_space)
-            print(f"Found {len(color_percentages)} unique colors (quantization level: {args.quantize})")
-            
-            print("Generating color wheel...")
-            wheel, normalized_percentages, opacity_values = create_color_wheel(color_percentages, args.size, quantize_level=args.quantize, force_kdtree=force_kdtree, use_parallel=use_parallel)
-            
-            # Auto-detect format from file extension if not explicitly specified
-            output_path = args.output
-            if args.format == "png" and (output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg')):
-                print("Auto-detected JPG format from file extension")
-                format_to_use = "jpg"
-            elif args.format == "jpg" and output_path.lower().endswith('.png'):
-                print("Auto-detected PNG format from file extension")
-                format_to_use = "png"
-            else:
-                format_to_use = args.format
-            
-            # Handle output format
-            if format_to_use == "jpg":
-                # JPG doesn't support transparency, so blend with black background
-                if not output_path.lower().endswith('.jpg') and not output_path.lower().endswith('.jpeg'):
-                    output_path = output_path.rsplit('.', 1)[0] + '.jpg'
-                    print(f"Changed output format to JPG: {output_path}")
-                
-                # Convert RGBA to RGB by blending with black background
-                rgb_wheel = np.zeros((wheel.shape[0], wheel.shape[1], 3), dtype=np.uint8)
-                alpha = wheel[:, :, 3] / 255.0  # Normalize alpha to 0-1
-                
-                for i in range(3):  # RGB channels
-                    rgb_wheel[:, :, i] = (wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background (0)
-                
-                # Convert RGB to BGR for OpenCV
-                wheel_bgr = rgb_wheel[:, :, [2, 1, 0]]  # RGB -> BGR
-                success = cv2.imwrite(output_path, wheel_bgr)
-                
-            else:  # PNG format
-                # Ensure output filename has .png extension for RGBA support
-                if not output_path.lower().endswith('.png'):
-                    output_path = output_path.rsplit('.', 1)[0] + '.png'
-                    print(f"Changed output format to PNG for transparency support: {output_path}")
-                
-                # Ensure wheel array is proper uint8 format
-                wheel = wheel.astype(np.uint8)
-                
-                # Save directly as RGBA PNG (no conversion needed)
-                # OpenCV expects BGR or BGRA, so convert RGBA to BGRA
-                wheel_bgra = wheel[:, :, [2, 1, 0, 3]]  # Swap R and B channels: RGBA -> BGRA
-                success = cv2.imwrite(output_path, wheel_bgra)
-            
-            if not success:
-                print(f"Error: Failed to save image to {output_path}")
-                return 1
-            
-            print(f"Color wheel saved to: {output_path}")
-            
-            # Optionally save reference wheel
-            if args.show_reference:
-                reference_wheel = add_wheel_gradient(args.size, quantize_level=args.quantize)
-                
-                if format_to_use == "jpg":
-                    # Convert reference wheel to RGB with black background
-                    rgb_ref = np.zeros((reference_wheel.shape[0], reference_wheel.shape[1], 3), dtype=np.uint8)
-                    alpha = reference_wheel[:, :, 3] / 255.0
-                    
-                    for i in range(3):
-                        rgb_ref[:, :, i] = (reference_wheel[:, :, i] * alpha + 0 * (1 - alpha)).astype(np.uint8)  # Black background
-                    
-                    reference_wheel_bgr = rgb_ref[:, :, [2, 1, 0]]
-                    reference_path = output_path.replace('.jpg', '_reference.jpg').replace('.jpeg', '_reference.jpg')
-                    cv2.imwrite(reference_path, reference_wheel_bgr)
-                else:
-                    reference_wheel_bgra = reference_wheel[:, :, [2, 1, 0, 3]]
-                    reference_path = output_path.replace('.png', '_reference.png')
-                    cv2.imwrite(reference_path, reference_wheel_bgra)
-                    
-                print(f"Reference wheel saved to: {reference_path}")
-            
-            # Generate histogram if requested
-            if args.histogram:
-                print("Generating opacity histogram...")
-                histogram_path = output_path.rsplit('.', 1)[0] + '_histogram.png'
-                create_opacity_histogram(opacity_values, histogram_path)
-                
-            # Generate color spectrum histogram if requested
-            if args.color_spectrum:
-                print("Generating color spectrum histogram...")
-                spectrum_path = output_path.rsplit('.', 1)[0] + '_color_spectrum.png'
-                create_color_spectrum_histogram(color_percentages, spectrum_path)
-                
-            # Generate circular color spectrum if requested
-            if args.circular_spectrum:
-                print("Generating circular color spectrum...")
-                circular_path = output_path.rsplit('.', 1)[0] + '_circular_spectrum.png'
-                create_circular_color_spectrum(color_percentages, circular_path)
-                
-            total_time = time.time() - total_start
-            print(f"\nTotal processing completed in {format_time(total_time)}")
-                
-        except Exception as e:
-            print(f"Error: {e}")
-            return 1
-    
-    return 0
+        return process_single_file(args)
 
 
 if __name__ == "__main__":
