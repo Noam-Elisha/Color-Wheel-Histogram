@@ -50,6 +50,7 @@ This tool analyzes images and creates color wheel visualizations where:
 
 ### Core Functionality
 - Color wheel generation - maps image colors to traditional color wheel positions
+- Interpolation smoothing - creates smoother gradients by spreading colors around found pixels
 - Multiple visualizations - histograms, spectrums, and circular color plots  
 - Flexible image support - works with common image formats (JPG, PNG, BMP, etc.)
 - Customizable parameters - adjustable quantization, sampling, and output options
@@ -110,6 +111,12 @@ python color_wheel.py input_image.jpg output_wheel.png --show-reference --histog
 
 # Performance mode
 python color_wheel.py input_image.jpg output_wheel.png --gpu --parallel --force-kdtree
+
+# Smooth gradients with interpolation
+python color_wheel.py input_image.jpg output_wheel.png --interpolation-strength 0.3
+
+# Strong smoothing with custom radius
+python color_wheel.py input_image.jpg output_wheel.png --interpolation-strength 0.6 --interpolation-radius 15
 ```
 
 ### Folder Processing
@@ -159,6 +166,14 @@ Visualization Options:
   --histogram           Generate opacity histogram
   --color-spectrum      Generate color spectrum histogram
   --circular-spectrum   Generate circular color spectrum
+
+Interpolation Options:
+  --interpolation-strength FLOAT
+                        Strength of interpolation smoothing (0.0-1.0, default: 0.0)
+                        Creates smoother gradients by spreading colors around found pixels
+  --interpolation-radius PIXELS  
+                        Radius for interpolation spreading (0=auto-scale, default: 0)
+                        Controls how far colors spread from their original positions
 ```
 
 ### Folder Processing Notes
@@ -187,9 +202,10 @@ A circular arrangement showing color progression around the wheel perimeter.
 
 ### Core Components
 
-- `create_color_wheel()` - Main color wheel generation function
+- `create_color_wheel()` - Main color wheel generation function with interpolation support
 - `load_and_analyze_image()` - Image loading and color analysis
 - `find_nearest_wheel_colors()` - Color mapping to wheel positions
+- `apply_proximity_interpolation()` - Proximity-based smoothing for color gradients
 - Template System - Efficient wheel template generation and caching
 - Visualization Functions - Multiple output format generators
 
