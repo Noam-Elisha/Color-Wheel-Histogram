@@ -15,17 +15,17 @@ This tool analyzes images and creates color wheel visualizations where:
 ### Van Gogh's Starry Night
 | Original | Color Wheel |
 |----------|-------------|
-| ![Starry Night](examples/images/starry_night.jpg) | ![Starry Night Color Wheel](examples/wheels/starry_night_color_wheel.jpg) |
+| ![Starry Night](examples/images/starry_night.jpg) | ![Starry Night Color Wheel](examples/color_wheels/starry_night_color_wheel.jpg) |
 
 ### Windows Bliss Wallpaper
 | Original | Color Wheel |
 |----------|-------------|
-| ![Bliss](examples/images/bliss.png) | ![Bliss Color Wheel](examples/wheels/bliss_color_wheel.jpg) |
+| ![Bliss](examples/images/bliss.png) | ![Bliss Color Wheel](examples/color_wheels/bliss_color_wheel.jpg) |
 
 ### Hubble's Pillars of Creation
 | Original | Color Wheel |
 |----------|-------------|
-| ![Pillars](examples/images/pillars_of_creation.jpg) | ![Pillars Color Wheel](examples/wheels/pillars_of_creation_color_wheel.jpg) |
+| ![Pillars](examples/images/pillars_of_creation.jpg) | ![Pillars Color Wheel](examples/color_wheels/pillars_of_creation_color_wheel.jpg) |
 
 ## Quick Start
 
