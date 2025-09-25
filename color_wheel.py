@@ -1894,6 +1894,41 @@ def create_circular_color_spectrum(color_percentages, output_path, size=800):
     print(f"Circular color spectrum saved to: {output_path}")
 
 
+def display_color_wheel(wheel, title="Color Wheel"):
+    """
+    Display the color wheel in a window using matplotlib.
+    
+    Args:
+        wheel (numpy.ndarray): The color wheel image (BGRA format from OpenCV)
+        title (str): Window title for the display
+    """
+    # Convert from OpenCV BGRA to matplotlib RGB format
+    if wheel.shape[2] == 4:  # BGRA format
+        # OpenCV uses BGRA, matplotlib uses RGBA
+        wheel_rgba = wheel.copy()
+        wheel_rgba[:, :, [0, 2]] = wheel_rgba[:, :, [2, 0]]  # Swap B and R channels
+        display_image = wheel_rgba
+    elif wheel.shape[2] == 3:  # BGR format  
+        # Convert BGR to RGB
+        display_image = wheel[:, :, [2, 1, 0]]
+    else:
+        display_image = wheel
+    
+    # Create the figure and display
+    plt.figure(figsize=(5, 5))
+    plt.gcf().set_facecolor('black')  # Set background to black
+    plt.imshow(display_image)
+    plt.axis('off')  # Hide axes for cleaner display
+    plt.title(title, fontsize=16, pad=20)
+    plt.tight_layout()
+    
+    print(f"Displaying {title} in window...")
+    print("Close the window to continue or exit the program.")
+    
+    # Show the window (this will block until the window is closed)
+    plt.show()
+
+
 def get_supported_image_files(folder_path):
     """
     Get all supported image files from a folder.
@@ -2082,7 +2117,7 @@ def create_argument_parser():
         description="Generate a color wheel where opacity represents color frequency in an image or folder of images"
     )
     parser.add_argument("input", help="Path to the input image or folder containing images")
-    parser.add_argument("output", nargs='?', help="Path for the output color wheel image (only used when processing single images)")
+    parser.add_argument("output", nargs='?', help="Path for the output color wheel image (optional - if not provided, displays in window for single images)")
     parser.add_argument("--size", type=int, default=800, help="Size of the color wheel (default: 800)")
     parser.add_argument("--sample-factor", type=int, default=1, 
                        help="Factor to downsample input image for faster processing (default: 1)")
@@ -2291,10 +2326,7 @@ def process_single_file(args):
         print(f"Error: Input file does not exist: {input_path}")
         return 1
     
-    if args.output is None:
-        print("Error: Output path is required when processing a single image.")
-        print("Usage: python color_wheel.py input_image.jpg output_wheel.png")
-        return 1
+    # No validation needed - output is now optional for single images
     
     try:
         total_start = time.time()
@@ -2313,19 +2345,27 @@ def process_single_file(args):
             interpolation_strength=args.interpolation_strength, interpolation_radius=args.interpolation_radius
         )
         
-        # Determine output format and save wheel
-        format_to_use = determine_output_format(args, args.output)
-        success, final_output_path = save_wheel_image(wheel, args.output, format_to_use)
-        
-        if not success:
-            print(f"Error: Failed to save image to {final_output_path}")
-            return 1
-        
-        print(f"Color wheel saved to: {final_output_path}")
-        
-        # Save additional outputs
-        save_reference_wheel(args, final_output_path, format_to_use)
-        generate_additional_outputs(args, final_output_path, color_percentages, opacity_values)
+        if args.output is None:
+            # Display the wheel in a window instead of saving
+            display_color_wheel(wheel, f"Color Wheel - {os.path.basename(input_path)}")
+            
+            # For additional outputs, we need to handle the case where there's no output path
+            if args.show_reference or args.histogram or args.color_spectrum or args.circular_spectrum:
+                print("Note: Additional outputs (reference wheel, histograms) require an output path to be specified.")
+        else:
+            # Determine output format and save wheel
+            format_to_use = determine_output_format(args, args.output)
+            success, final_output_path = save_wheel_image(wheel, args.output, format_to_use)
+            
+            if not success:
+                print(f"Error: Failed to save image to {final_output_path}")
+                return 1
+            
+            print(f"Color wheel saved to: {final_output_path}")
+            
+            # Save additional outputs
+            save_reference_wheel(args, final_output_path, format_to_use)
+            generate_additional_outputs(args, final_output_path, color_percentages, opacity_values)
         
         total_time = time.time() - total_start
         print(f"\nTotal processing completed in {format_time(total_time)}")
