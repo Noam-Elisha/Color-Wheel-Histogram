@@ -1894,35 +1894,99 @@ def create_circular_color_spectrum(color_percentages, output_path, size=800):
     print(f"Circular color spectrum saved to: {output_path}")
 
 
-def display_color_wheel(wheel, title="Color Wheel"):
+def display_color_wheel(wheel, title="Color Wheel", input_image_path=None):
     """
     Display the color wheel in a window using matplotlib.
     
     Args:
         wheel (numpy.ndarray): The color wheel image (BGRA format from OpenCV)
         title (str): Window title for the display
+        input_image_path (str, optional): Path to input image for side-by-side display
     """
-    # Convert from OpenCV BGRA to matplotlib RGB format
+    # Convert wheel from OpenCV BGRA to matplotlib RGB format
     if wheel.shape[2] == 4:  # BGRA format
         # OpenCV uses BGRA, matplotlib uses RGBA
         wheel_rgba = wheel.copy()
         wheel_rgba[:, :, [0, 2]] = wheel_rgba[:, :, [2, 0]]  # Swap B and R channels
-        display_image = wheel_rgba
+        wheel_display = wheel_rgba
     elif wheel.shape[2] == 3:  # BGR format  
         # Convert BGR to RGB
-        display_image = wheel[:, :, [2, 1, 0]]
+        wheel_display = wheel[:, :, [2, 1, 0]]
     else:
-        display_image = wheel
+        wheel_display = wheel
     
-    # Create the figure and display
-    plt.figure(figsize=(5, 5))
-    plt.gcf().set_facecolor('black')  # Set background to black
-    plt.imshow(display_image)
-    plt.axis('off')  # Hide axes for cleaner display
-    plt.title(title, fontsize=16, pad=20)
+    # Check if we should display side-by-side
+    if input_image_path and os.path.exists(input_image_path):
+        try:
+            # Load input image
+            input_image = cv2.imread(input_image_path)
+            if input_image is None:
+                print(f"Warning: Could not load input image {input_image_path}, showing wheel only")
+            else:
+                # Convert from BGR to RGB for matplotlib
+                input_rgb = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+                
+                # Resize images to same height for side-by-side combination
+                wheel_height, wheel_width = wheel_display.shape[:2]
+                input_height, input_width = input_rgb.shape[:2]
+                
+                # Use wheel height as target height
+                target_height = wheel_height
+                
+                # Calculate new width for input image to maintain aspect ratio
+                aspect_ratio = input_width / input_height
+                target_input_width = int(target_height * aspect_ratio)
+                
+                # Resize input image
+                input_resized = cv2.resize(input_rgb, (target_input_width, target_height))
+                
+                # Create combined image (side by side)
+                # Add some padding between images
+                padding = 20
+                combined_width = wheel_width + target_input_width + padding
+                combined_height = target_height
+                
+                # Create combined image with black background
+                if wheel_display.shape[2] == 4:  # RGBA
+                    combined_image = np.zeros((combined_height, combined_width, 4), dtype=np.uint8)
+                    # Set alpha channel to full opacity for input image area
+                    combined_image[:, :target_input_width, 3] = 255
+                else:  # RGB
+                    combined_image = np.zeros((combined_height, combined_width, 3), dtype=np.uint8)
+                
+                # Place input image on the left
+                combined_image[:target_height, :target_input_width, :3] = input_resized
+                
+                # Place wheel on the right (with padding)
+                wheel_start_x = target_input_width + padding
+                if wheel_display.shape[2] == 4:  # RGBA wheel
+                    combined_image[:wheel_height, wheel_start_x:wheel_start_x + wheel_width] = wheel_display
+                else:  # RGB wheel
+                    combined_image[:wheel_height, wheel_start_x:wheel_start_x + wheel_width, :3] = wheel_display
+                
+                # Display the combined image
+                plt.figure(figsize=(12, 6))
+                plt.gcf().set_facecolor('black')
+                plt.imshow(combined_image)
+                plt.axis('off')
+                plt.title(f"{title} - Input Image & Color Wheel", fontsize=16, color='white', pad=20)
+                
+                print(f"Displaying input image and {title} side by side...")
+                
+        except Exception as e:
+            print(f"Warning: Error processing input image {input_image_path}: {e}, showing wheel only")
+            input_image_path = None
+    
+    # If no input image or error loading, display wheel only (original behavior)
+    if not input_image_path or 'combined_image' not in locals():
+        plt.figure(figsize=(8, 8))
+        plt.gcf().set_facecolor('black')
+        plt.imshow(wheel_display)
+        plt.axis('off')
+        plt.title(title, fontsize=16, color='white', pad=20)
+        print(f"Displaying {title} in window...")
+    
     plt.tight_layout()
-    
-    print(f"Displaying {title} in window...")
     print("Close the window to continue or exit the program.")
     
     # Show the window (this will block until the window is closed)
@@ -2153,6 +2217,8 @@ def create_argument_parser():
                        help="Strength of interpolation effect (0.0 = none, 1.0 = maximum, default: 0.0)")
     parser.add_argument("--interpolation-radius", type=int, default=0, metavar="PIXELS",
                        help="Radius for interpolation spreading in pixels (0 = auto-scale with wheel size, default: 0)")
+    parser.add_argument("--show-input", action="store_true",
+                       help="Display input image alongside color wheel (only works when no output path is specified)")
     return parser
 
 
@@ -2347,7 +2413,8 @@ def process_single_file(args):
         
         if args.output is None:
             # Display the wheel in a window instead of saving
-            display_color_wheel(wheel, f"Color Wheel - {os.path.basename(input_path)}")
+            input_image_for_display = input_path if args.show_input else None
+            display_color_wheel(wheel, f"Color Wheel - {os.path.basename(input_path)}", input_image_for_display)
             
             # For additional outputs, we need to handle the case where there's no output path
             if args.show_reference or args.histogram or args.color_spectrum or args.circular_spectrum:
